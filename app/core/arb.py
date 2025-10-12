@@ -18,8 +18,8 @@ def detect_arbs(
     # Index by event -> outcome quotes
     from collections import defaultdict
 
-    k_by_event = defaultdict(dict)
-    p_by_event = defaultdict(dict)
+    k_by_event: dict[str, dict[str, MarketQuote]] = defaultdict(dict)
+    p_by_event: dict[str, dict[str, MarketQuote]] = defaultdict(dict)
     for q in kalshi_quotes:
         k_by_event[q.event][q.outcome] = q
     for q in polymarket_quotes:
@@ -70,8 +70,8 @@ def detect_two_buy_arbs(
 ) -> List[TwoBuyArb]:
     from collections import defaultdict
 
-    k_by_event = defaultdict(dict)
-    p_by_event = defaultdict(dict)
+    k_by_event: dict[str, dict[str, MarketQuote]] = defaultdict(dict)
+    p_by_event: dict[str, dict[str, MarketQuote]] = defaultdict(dict)
     for q in kalshi_quotes:
         k_by_event[q.event][q.outcome] = q
     for q in polymarket_quotes:
@@ -85,9 +85,13 @@ def detect_two_buy_arbs(
         # Case A: buy YES on Kalshi, buy NO on Polymarket
         if "YES" in k and "NO" in p:
             sum_price = k["YES"].price + p["NO"].price
-            edge = 1.0 - sum_price - 2 * taker_fee
+            # Fees scale with notional, so subtract fee on each leg proportional to price
+            edge = 1.0 - sum_price - taker_fee * (k["YES"].price + p["NO"].price)
             if edge > 0:
-                contracts = min(k["YES"].size, p["NO"].size, settings.risk.max_notional_per_leg)
+                # Cap by available size and per-leg notional limits (convert $ cap to contracts)
+                cap_yes = settings.risk.max_notional_per_leg / max(k["YES"].price, 1e-9)
+                cap_no = settings.risk.max_notional_per_leg / max(p["NO"].price, 1e-9)
+                contracts = min(k["YES"].size, p["NO"].size, cap_yes, cap_no)
                 gross_profit = edge * contracts
                 results.append(
                     TwoBuyArb(
@@ -103,9 +107,11 @@ def detect_two_buy_arbs(
         # Case B: buy YES on Polymarket, buy NO on Kalshi
         if "YES" in p and "NO" in k:
             sum_price = p["YES"].price + k["NO"].price
-            edge = 1.0 - sum_price - 2 * taker_fee
+            edge = 1.0 - sum_price - taker_fee * (p["YES"].price + k["NO"].price)
             if edge > 0:
-                contracts = min(p["YES"].size, k["NO"].size, settings.risk.max_notional_per_leg)
+                cap_yes = settings.risk.max_notional_per_leg / max(p["YES"].price, 1e-9)
+                cap_no = settings.risk.max_notional_per_leg / max(k["NO"].price, 1e-9)
+                contracts = min(p["YES"].size, k["NO"].size, cap_yes, cap_no)
                 gross_profit = edge * contracts
                 results.append(
                     TwoBuyArb(

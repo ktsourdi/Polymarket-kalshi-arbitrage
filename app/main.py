@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from typing import List
 
 from app.connectors.demo import fetch_kalshi_demo, fetch_polymarket_demo
 from app.core.arb import detect_arbs, detect_two_buy_arbs
