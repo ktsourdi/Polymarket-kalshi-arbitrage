@@ -54,3 +54,29 @@ class PolymarketClient:
                 )
             )
         return quotes
+
+    async def place_limit_order(
+        self,
+        market_id: str,
+        outcome: str,
+        side: str,
+        price: float,
+        size: float,
+        tif: str = "GTC",
+    ) -> dict:
+        """Skeleton for placing a limit order on Polymarket.
+
+        Notes:
+        - Polymarket uses CLOB; requires API key and signature.
+        - This function currently does nothing and returns a stub.
+        """
+        logger.info(
+            "[DRY-RUN Polymarket] place %s %s %s @ %.2f size %.4f",
+            side,
+            outcome,
+            market_id,
+            price,
+            size,
+        )
+        # TODO: implement real HTTP request to Polymarket order endpoint
+        return {"status": "stub", "id": None}

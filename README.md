@@ -26,7 +26,26 @@ This demo uses mocked quotes to verify the pipeline: quote load -> arbitrage det
 
 ## Next steps
 
-- Add real Kalshi and Polymarket APIs and authentication
-- Implement robust event matching and explicit mapping
-- Add sizing with balances, fees, and slippage controls
-- Implement live execution and risk checks
+### Live trading (auto-buy skeleton)
+
+Set `LIVE=1` to trigger live mode. The current implementation wires a `LiveExecutor` that would place two buy orders (YES and NO across exchanges) when a sum-of-prices opportunity exists. The API calls are stubs; you must fill in auth and endpoints.
+
+```bash
+LIVE=1 python3 - << 'PY'
+import asyncio
+from app.main import run_live_once
+asyncio.run(run_live_once())
+PY
+```
+
+Environment variables expected (to be finalized when wiring real APIs):
+
+- `KALSHI_API_KEY`, `KALSHI_API_SECRET`, `KALSHI_BASE_URL`
+- `POLYMARKET_API_KEY`, `POLYMARKET_BASE_URL`
+
+### Roadmap
+
+- Implement real Kalshi and Polymarket order/endpoints
+- Robust event matching and explicit mapping
+- Sizing with balances, fees, and slippage controls
+- Live execution safeguards, retries, hedging, and reconciliation

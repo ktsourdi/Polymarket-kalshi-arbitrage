@@ -32,3 +32,19 @@ class MatchCandidate:
     kalshi_market_id: Optional[str]
     polymarket_market_id: Optional[str]
     similarity: float
+
+
+@dataclass(frozen=True)
+class TwoBuyArb:
+    """Represents a buy-YES on one exchange and buy-NO on the other.
+
+    Profit per contract ≈ 1 - (yes_price + no_price) minus fees and slippage.
+    """
+
+    event_key: str
+    buy_yes: MarketQuote
+    buy_no: MarketQuote
+    sum_price: float
+    edge_bps: float
+    contracts: float
+    gross_profit_usd: float

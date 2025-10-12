@@ -55,3 +55,30 @@ class KalshiClient:
                 )
             )
         return quotes
+
+    async def place_limit_order(
+        self,
+        market_id: str,
+        outcome: str,
+        side: str,
+        price: float,
+        size: float,
+        tif: str = "GTC",
+    ) -> dict:
+        """Skeleton for placing a limit order on Kalshi.
+
+        Notes:
+        - Kalshi API requires auth headers and specific endpoints.
+        - Price is typically in cents; convert as needed when implementing.
+        - This function currently does nothing and returns a stub.
+        """
+        logger.info(
+            "[DRY-RUN Kalshi] place %s %s %s @ %.2f size %.4f",
+            side,
+            outcome,
+            market_id,
+            price,
+            size,
+        )
+        # TODO: implement real HTTP POST to Kalshi order endpoint
+        return {"status": "stub", "id": None}
