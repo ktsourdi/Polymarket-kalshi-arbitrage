@@ -84,7 +84,7 @@ def render_cross_arbs(arbs: List[CrossExchangeArb]):
                 "gross_profit_usd": round(a.gross_profit_usd, 2),
             }
         )
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, width='stretch', hide_index=True)
 
 
 def render_two_buy(arbs: List[TwoBuyArb]):
@@ -104,7 +104,7 @@ def render_two_buy(arbs: List[TwoBuyArb]):
                 "gross_profit_usd": round(a.gross_profit_usd, 2),
             }
         )
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, width='stretch', hide_index=True)
 
 
 with st.sidebar:
@@ -159,5 +159,26 @@ elif data_mode == "Live data (read-only)" and mode == "Run live-skeleton":
 
         result = asyncio.run(_run())
         st.success(f"Live-skeleton executed. Opportunities handled: {result}")
+
+# Diagnostics
+st.markdown("---")
+def _sample(events, n=5):
+    seen = []
+    for e in events:
+        if e not in seen:
+            seen.append(e)
+        if len(seen) >= n:
+            break
+    return seen
+
+kalshi_events = [q.event for q in kalshi]
+poly_events = [q.event for q in poly]
+col1, col2 = st.columns(2)
+with col1:
+    st.caption("Kalshi live quotes")
+    st.write({"count": len(kalshi_events), "sample": _sample(kalshi_events)})
+with col2:
+    st.caption("Polymarket live quotes")
+    st.write({"count": len(poly_events), "sample": _sample(poly_events)})
 
 

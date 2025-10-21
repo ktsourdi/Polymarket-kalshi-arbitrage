@@ -20,15 +20,18 @@ def detect_arbs(
 
     k_by_event: dict[str, dict[str, MarketQuote]] = defaultdict(dict)
     p_by_event: dict[str, dict[str, MarketQuote]] = defaultdict(dict)
+    def key(e: str) -> str:
+        return e.lower().strip()
+
     for q in kalshi_quotes:
-        k_by_event[q.event][q.outcome] = q
+        k_by_event[key(q.event)][q.outcome] = q
     for q in polymarket_quotes:
-        p_by_event[q.event][q.outcome] = q
+        p_by_event[key(q.event)][q.outcome] = q
 
     arbs: List[CrossExchangeArb] = []
-    for event in set(k_by_event.keys()) & set(p_by_event.keys()):
-        k = k_by_event[event]
-        p = p_by_event[event]
+    for event_key in set(k_by_event.keys()) & set(p_by_event.keys()):
+        k = k_by_event[event_key]
+        p = p_by_event[event_key]
         if "YES" in k and "NO" in p:
             edge_bps = compute_edge_bps(k["YES"].price, p["NO"].price) - settings.fees.taker_bps
             if edge_bps > 0:
@@ -37,7 +40,7 @@ def detect_arbs(
                 if gross_profit >= settings.risk.min_profit_usd:
                     arbs.append(
                         CrossExchangeArb(
-                            event_key=event,
+                            event_key=event_key,
                             long=k["YES"],
                             short=p["NO"],
                             edge_bps=edge_bps,
@@ -53,7 +56,7 @@ def detect_arbs(
                 if gross_profit >= settings.risk.min_profit_usd:
                     arbs.append(
                         CrossExchangeArb(
-                            event_key=event,
+                            event_key=event_key,
                             long=p["YES"],
                             short=k["NO"],
                             edge_bps=edge_bps,
