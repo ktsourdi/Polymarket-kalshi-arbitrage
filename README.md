@@ -16,6 +16,33 @@ PY
 
 This demo uses mocked quotes to verify the pipeline: quote load -> arbitrage detection -> paper execution.
 
+### Setup (recommended)
+
+Create a virtual environment and install minimal deps:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+If `pip` is not on PATH, use `python -m pip` instead of `pip`.
+
+### Run live skeleton
+
+Requires `httpx` to be installed (provided via `requirements.txt`). API calls are stubs; this only exercises the async order submission path.
+
+```bash
+LIVE=1 python3 - << 'PY'
+import asyncio
+from app.main import run_live_once
+asyncio.run(run_live_once())
+PY
+```
+
+If you encounter `ModuleNotFoundError: httpx`, ensure dependencies are installed as above.
+
 ## Project layout
 
 - `app/main.py`: demo entrypoint
@@ -30,13 +57,7 @@ This demo uses mocked quotes to verify the pipeline: quote load -> arbitrage det
 
 Set `LIVE=1` to trigger live mode. The current implementation wires a `LiveExecutor` that would place two buy orders (YES and NO across exchanges) when a sum-of-prices opportunity exists. The API calls are stubs; you must fill in auth and endpoints.
 
-```bash
-LIVE=1 python3 - << 'PY'
-import asyncio
-from app.main import run_live_once
-asyncio.run(run_live_once())
-PY
-```
+See "Run live skeleton" above.
 
 Environment variables expected (to be finalized when wiring real APIs):
 

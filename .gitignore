@@ -2,3 +2,14 @@
 __pycache__
 *.pyc
 .env
+.env.*
+!.env.example
+
+# Secrets/keys
+*.pem
+*.key
+*.crt
+kalshi_api_private.pem
+
+# OS/editor
+.DS_Store
