@@ -35,34 +35,73 @@ class KalshiClient:
         Note: Full authenticated flow requires signed headers. Here we first
         try public endpoints if available; otherwise return empty list.
         """
+        markets: List[dict] = []
         try:
             url = os.environ.get("KALSHI_MARKETS_URL") or f"{self.base_url}/markets"
             headers = {}
             if self.bearer_token:
                 headers["Authorization"] = f"Bearer {self.bearer_token}"
-            resp = await self._client.get(url, headers=headers, timeout=15)
-            if resp.status_code == 401:
-                # Try public elections endpoint as a fallback
-                fallback = os.environ.get("KALSHI_FALLBACK_PUBLIC_URL") or "https://api.elections.kalshi.com/trade-api/v2/markets"
-                try:
-                    resp2 = await self._client.get(fallback, timeout=15)
-                    resp2.raise_for_status()
-                    data2 = resp2.json()
-                    if isinstance(data2, dict) and "markets" in data2:
-                        return list(data2.get("markets") or [])
-                    if isinstance(data2, list):
-                        return data2
-                except Exception as exc2:  # noqa: BLE001
-                    logger.warning("Kalshi fallback public markets failed: %s", exc2)
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, dict) and "markets" in data:
-                return list(data.get("markets") or [])
-            if isinstance(data, list):
-                return data
+            cursor = None
+            max_pages = int(os.environ.get("KALSHI_MAX_PAGES", "2"))
+            page = 0
+            for _ in range(max_pages):  # soft cap to avoid huge downloads
+                params = {"limit": int(os.environ.get("KALSHI_PAGE_LIMIT", "1000")), "status": "active"}
+                if cursor:
+                    params["cursor"] = cursor
+                resp = await self._client.get(url, headers=headers, params=params, timeout=15)
+                if resp.status_code == 401:
+                    break
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, dict):
+                    items = data.get("markets") or []
+                    if items:
+                        markets.extend(items)
+                    cursor = data.get("cursor")
+                    page += 1
+                    if not cursor or page >= max_pages:
+                        break
+                elif isinstance(data, list):
+                    markets.extend(data)
+                    break
+                else:
+                    break
+            if markets:
+                return markets
+            # Try public fallback (elections API) with pagination if available
+            fallback = os.environ.get("KALSHI_FALLBACK_PUBLIC_URL") or "https://api.elections.kalshi.com/trade-api/v2/markets"
+            cursor = None
+            page = 0
+            for _ in range(max_pages):
+                # Elections API often rejects unknown params; do NOT pass status
+                params = {"limit": int(os.environ.get("KALSHI_PAGE_LIMIT", "1000"))}
+                if cursor:
+                    params["cursor"] = cursor
+                resp2 = await self._client.get(fallback, params=params, timeout=15)
+                # If 400, retry once without params except cursor/limit adjustments
+                if resp2.status_code == 400:
+                    params = {"limit": int(os.environ.get("KALSHI_PAGE_LIMIT", "1000"))}
+                    if cursor:
+                        params["cursor"] = cursor
+                    resp2 = await self._client.get(fallback, params=params, timeout=15)
+                resp2.raise_for_status()
+                data2 = resp2.json()
+                if isinstance(data2, dict):
+                    items = data2.get("markets") or []
+                    if items:
+                        markets.extend(items)
+                    cursor = data2.get("cursor")
+                    page += 1
+                    if not cursor or page >= max_pages:
+                        break
+                elif isinstance(data2, list):
+                    markets.extend(data2)
+                    break
+                else:
+                    break
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to fetch Kalshi markets: %s", exc)
-        return []
+        return markets
 
     async def fetch_quotes(self) -> List[MarketQuote]:
         markets = await self.fetch_markets()

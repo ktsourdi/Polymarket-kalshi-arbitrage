@@ -131,3 +131,105 @@ def detect_two_buy_arbs(
     # Filter by min profit
     results = [r for r in results if r.gross_profit_usd >= settings.risk.min_profit_usd]
     return results
+
+
+def detect_arbs_with_matcher(
+    kalshi_quotes: Iterable[MarketQuote],
+    polymarket_quotes: Iterable[MarketQuote],
+    similarity_threshold: float = 0.78,
+) -> List[CrossExchangeArb]:
+    """Detect cross-exchange arbs using fuzzy event matching.
+
+    This pairs events by text similarity (via `EventMatcher`) and then applies the
+    same pricing logic as `detect_arbs`.
+    """
+    from collections import defaultdict
+    from app.core.matching import EventMatcher
+
+    # Index quotes by event and outcome for both exchanges
+    def key_event(e: str) -> str:
+        return e.lower().strip()
+
+    k_by_event: dict[str, dict[str, MarketQuote]] = defaultdict(dict)
+    p_by_event: dict[str, dict[str, MarketQuote]] = defaultdict(dict)
+    unique_k_events: set[str] = set()
+    unique_p_events: set[str] = set()
+    for q in kalshi_quotes:
+        k_by_event[key_event(q.event)][q.outcome] = q
+        unique_k_events.add(q.event)
+    for q in polymarket_quotes:
+        p_by_event[key_event(q.event)][q.outcome] = q
+        unique_p_events.add(q.event)
+
+    # Build fuzzy mapping from Kalshi -> best Polymarket event
+    matcher = EventMatcher(threshold=similarity_threshold)
+    candidates = matcher.build_candidates(
+        [MarketQuote("kalshi", "", e, "YES", 0.0, 0.0) for e in []],  # not used
+        [MarketQuote("polymarket", "", e, "YES", 0.0, 0.0) for e in []],  # not used
+    )
+    # The build_candidates in our matcher expects quotes; improvise a local match:
+    from app.utils.text import similarity
+
+    mapping: dict[str, str] = {}
+    for ek in unique_k_events:
+        best_sim = -1.0
+        best_ep = None
+        for ep in unique_p_events:
+            s = similarity(ek, ep)
+            if s > best_sim:
+                best_sim = s
+                best_ep = ep
+        if best_ep and best_sim >= similarity_threshold:
+            mapping[key_event(ek)] = key_event(best_ep)
+
+    # For mapped pairs, compute arbs like in detect_arbs
+    arbs: List[CrossExchangeArb] = []
+    for ek_key, ep_key in mapping.items():
+        k = k_by_event.get(ek_key)
+        p = p_by_event.get(ep_key)
+        if not k or not p:
+            continue
+        # Case K YES vs P NO
+        if "YES" in k and "NO" in p:
+            edge_bps = compute_edge_bps(k["YES"].price, p["NO"].price) - settings.fees.taker_bps
+            if edge_bps > 0:
+                max_notional = min(
+                    k["YES"].size * k["YES"].price,
+                    p["NO"].size * (1 - p["NO"].price),
+                    settings.risk.max_notional_per_leg,
+                )
+                gross_profit = edge_bps / 10000.0 * max_notional
+                if gross_profit >= settings.risk.min_profit_usd:
+                    arbs.append(
+                        CrossExchangeArb(
+                            event_key=f"{k['YES'].event} <-> {p['NO'].event}",
+                            long=k["YES"],
+                            short=p["NO"],
+                            edge_bps=edge_bps,
+                            gross_profit_usd=gross_profit,
+                            max_notional=max_notional,
+                        )
+                    )
+        # Case P YES vs K NO
+        if "YES" in p and "NO" in k:
+            edge_bps = compute_edge_bps(p["YES"].price, k["NO"].price) - settings.fees.taker_bps
+            if edge_bps > 0:
+                max_notional = min(
+                    p["YES"].size * p["YES"].price,
+                    k["NO"].size * (1 - k["NO"].price),
+                    settings.risk.max_notional_per_leg,
+                )
+                gross_profit = edge_bps / 10000.0 * max_notional
+                if gross_profit >= settings.risk.min_profit_usd:
+                    arbs.append(
+                        CrossExchangeArb(
+                            event_key=f"{p['YES'].event} <-> {k['NO'].event}",
+                            long=p["YES"],
+                            short=k["NO"],
+                            edge_bps=edge_bps,
+                            gross_profit_usd=gross_profit,
+                            max_notional=max_notional,
+                        )
+                    )
+
+    return arbs

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List
 import os
 import json
+from datetime import datetime, timezone
 
 import httpx
 
@@ -49,10 +50,90 @@ class PolymarketClient:
             return []
 
         # Try Gamma API first, then CLOB fallback
-        markets = await _fetch(self._markets_url, params={"limit": 1000})
+        markets: List[dict] = []
+
+        async def paginate(url: str, base_params: dict) -> List[dict]:
+            items: List[dict] = []
+            offset = 0
+            max_pages = int(os.environ.get("POLYMARKET_MAX_PAGES", "3"))
+            for _ in range(max_pages):
+                params = {"limit": int(os.environ.get("POLYMARKET_PAGE_LIMIT", "1000")), "offset": offset}
+                params.update(base_params or {})
+                batch = await _fetch(url, params=params)
+                if not batch:
+                    break
+                items.extend(batch)
+                if len(batch) < int(os.environ.get("POLYMARKET_PAGE_LIMIT", "1000")):
+                    break
+                offset += len(batch)
+            return items
+
+        # Try Gamma with active filter first; if empty, retry without filter
+        gamma_markets = await paginate(self._markets_url, {"active": "true"})
+        if not gamma_markets:
+            gamma_markets = await paginate(self._markets_url, {})
+
+        markets.extend(gamma_markets)
+
+        # Fallback to CLOB markets if still nothing
         if not markets:
-            markets = await _fetch(self._clob_markets_url, params={"limit": 1000})
-        return markets
+            clob_markets = await paginate(self._clob_markets_url, {})
+            markets.extend(clob_markets)
+        # Basic client-side filtering to avoid stale/historical markets
+        def _is_live(m: dict) -> bool:
+            # Treat missing fields as unknown/okay; only exclude explicit negatives
+            if bool(m.get("archived")):
+                return False
+            if m.get("closed") is True:
+                return False
+            if m.get("active") is False:
+                return False
+            return True
+
+        raw_count = len(markets)
+        filtered = [m for m in markets if _is_live(m)]
+        # If filtering nukes everything but we did receive data, return raw so we can inspect
+        final = filtered if filtered or raw_count == 0 else markets
+        # Date filter: keep reasonably current markets (past 30d to next 365d)
+        def _parse_dt(value: str | None) -> datetime | None:
+            if not value or not isinstance(value, str):
+                return None
+            try:
+                if value.endswith("Z"):
+                    value = value[:-1] + "+00:00"
+                dt = datetime.fromisoformat(value)
+                # Ensure timezone-aware (UTC) for all comparisons
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+                return dt
+            except Exception:
+                return None
+
+        now = datetime.now(timezone.utc)
+        from datetime import timedelta
+        past_cutoff = now - timedelta(days=30)
+        future_cutoff = now + timedelta(days=365)
+
+        timed: List[dict] = []
+        for m in final:
+            dt = _parse_dt(m.get("endDateIso")) or _parse_dt(m.get("endDate"))
+            if dt is None:
+                # If no date info, include (we'll rely on event matching later)
+                timed.append(m)
+                continue
+            if past_cutoff <= dt <= future_cutoff:
+                timed.append(m)
+
+        logger.info(
+            "Polymarket markets fetched: raw=%d, post-filter=%d (returning=%d, date-window=%d)",
+            raw_count,
+            len(filtered),
+            len(final),
+            len(timed),
+        )
+        return timed
 
     async def fetch_quotes(self) -> List[MarketQuote]:
         markets = await self.fetch_markets()

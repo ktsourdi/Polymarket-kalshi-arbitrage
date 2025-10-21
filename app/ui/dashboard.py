@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import streamlit as st
 
 from app.connectors.demo import fetch_kalshi_demo, fetch_polymarket_demo
-from app.core.arb import detect_arbs, detect_two_buy_arbs
+from app.core.arb import detect_arbs, detect_two_buy_arbs, detect_arbs_with_matcher
 from app.core.models import CrossExchangeArb, TwoBuyArb
 
 
@@ -136,6 +136,8 @@ else:
 tab1, tab2 = st.tabs(["Cross-Exchange", "Two-Buy"])
 with tab1:
     cross = detect_arbs(kalshi, poly)
+    if not cross:
+        cross = detect_arbs_with_matcher(kalshi, poly, similarity_threshold=0.8)
     render_cross_arbs(cross)
 with tab2:
     two = detect_two_buy_arbs(kalshi, poly)
