@@ -5,6 +5,7 @@ from dataclasses import asdict
 from typing import List
 from pathlib import Path
 import sys
+import os
 
 # Ensure project root is on sys.path when running via Streamlit
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -19,7 +20,7 @@ from app.core.models import CrossExchangeArb, TwoBuyArb
 
 
 st.set_page_config(page_title="Polymarket–Kalshi Arbitrage", layout="wide")
-st.title("Polymarket–Kalshi Arbitrage Dashboard (Demo)")
+st.title("Polymarket–Kalshi Arbitrage Dashboard")
 
 
 @st.cache_data(ttl=5)
@@ -27,6 +28,40 @@ def load_quotes_sync():
     # Bridge async demo fetchers into Streamlit
     async def _run():
         return await asyncio.gather(fetch_kalshi_demo(), fetch_polymarket_demo())
+
+    return asyncio.run(_run())
+
+
+@st.cache_data(ttl=5)
+def load_quotes_live_sync():
+    async def _run():
+        from app.connectors.kalshi import KalshiClient
+        from app.connectors.polymarket import PolymarketClient
+
+        kalshi = KalshiClient(
+            base_url=os.getenv("KALSHI_BASE_URL"),
+            api_key=os.getenv("KALSHI_API_KEY"),
+            api_secret=os.getenv("KALSHI_API_SECRET"),
+        )
+        poly_ok = bool(os.getenv("POLYMARKET_PRIVATE_KEY") or os.getenv("POLYMARKET_API_KEY"))
+        poly = None
+        if poly_ok:
+            poly = PolymarketClient(
+                base_url=os.getenv("POLYMARKET_BASE_URL"),
+                api_key=os.getenv("POLYMARKET_API_KEY"),
+            )
+        try:
+            k = await kalshi.fetch_quotes()
+        finally:
+            await kalshi.close()
+        if poly:
+            try:
+                p = await poly.fetch_quotes()
+            finally:
+                await poly.close()
+        else:
+            p = []
+        return k, p
 
     return asyncio.run(_run())
 
@@ -74,14 +109,29 @@ def render_two_buy(arbs: List[TwoBuyArb]):
 
 with st.sidebar:
     st.markdown("### Controls")
-    mode = st.radio("Mode", ["Demo (detect only)", "Run demo pipeline", "Run live-skeleton"], index=0)
+    data_mode = st.radio("Data", ["Demo data", "Live data (read-only)"], index=0)
+    mode = st.radio("Mode", ["Detect only", "Run demo pipeline", "Run live-skeleton"], index=0)
     refresh = st.button("Refresh data", type="primary")
-    st.caption("Demo uses randomized mocked quotes.")
+    st.caption("Demo uses randomized mocked quotes. Live fetch attempts real APIs.")
+
+    st.markdown("### Env status")
+    kalshi_ok = bool(os.getenv("KALSHI_API_KEY"))
+    poly_ok = bool(os.getenv("POLYMARKET_PRIVATE_KEY") or os.getenv("POLYMARKET_API_KEY"))
+    st.write(f"Kalshi: {'OK' if kalshi_ok else 'missing'}")
+    st.write(f"Polymarket: {'OK' if poly_ok else 'not found'}")
 
 if refresh:
     load_quotes_sync.clear()
 
-kalshi, poly = load_quotes_sync()
+if data_mode == "Demo data":
+    kalshi, poly = load_quotes_sync()
+else:
+    if not kalshi_ok:
+        st.error("Kalshi credentials not found. Set KALSHI_API_KEY and private key settings in .env.")
+        st.stop()
+    if not poly_ok:
+        st.warning("Polymarket credentials not found. Proceeding with Kalshi-only live data; cross-exchange results will be empty until you add Polymarket creds.")
+    kalshi, poly = load_quotes_live_sync()
 
 tab1, tab2 = st.tabs(["Cross-Exchange", "Two-Buy"])
 with tab1:
@@ -93,7 +143,7 @@ with tab2:
 
 # Actions
 st.markdown("---")
-if mode == "Run demo pipeline":
+if data_mode == "Demo data" and mode == "Run demo pipeline":
     if st.button("Execute demo pipeline now"):
         async def _run():
             from app.main import run_once
@@ -101,7 +151,7 @@ if mode == "Run demo pipeline":
 
         result = asyncio.run(_run())
         st.success(f"Demo executed. Opportunities handled: {result}")
-elif mode == "Run live-skeleton":
+elif data_mode == "Live data (read-only)" and mode == "Run live-skeleton":
     if st.button("Execute live-skeleton now"):
         async def _run():
             from app.main import run_live_once

@@ -10,6 +10,13 @@ source .venv/bin/activate
 
 python -m pip install -r requirements.txt >/dev/null 2>&1 || true
 
+# Load .env if present
+if [ -f .env ]; then
+  set -a
+  . ./.env
+  set +a
+fi
+
 exec streamlit run app/ui/dashboard.py
 
 
