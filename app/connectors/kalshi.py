@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import List
+import os
 
 import httpx
 
@@ -16,14 +17,28 @@ class KalshiClient:
         self.base_url = base_url or "https://trading-api.kalshi.com/v2"
         self.api_key = api_key
         self.api_secret = api_secret
-        self._client = httpx.AsyncClient(timeout=10)
+        self._client = httpx.AsyncClient(timeout=15)
 
     async def close(self):
         await self._client.aclose()
 
     async def fetch_markets(self) -> List[dict]:
-        # Placeholder for real API; returns empty list in this scaffold
-        # See https://kalshi-public-docs.s3.amazonaws.com/kalshi_trading_api.html
+        """Fetch markets from Kalshi public endpoints (read-only fallback).
+
+        Note: Full authenticated flow requires signed headers. Here we first
+        try public endpoints if available; otherwise return empty list.
+        """
+        try:
+            url = os.environ.get("KALSHI_MARKETS_URL") or f"{self.base_url}/markets"
+            resp = await self._client.get(url, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict) and "markets" in data:
+                return list(data.get("markets") or [])
+            if isinstance(data, list):
+                return data
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to fetch Kalshi markets (public): %s", exc)
         return []
 
     async def fetch_quotes(self) -> List[MarketQuote]:
