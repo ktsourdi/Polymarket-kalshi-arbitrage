@@ -29,6 +29,12 @@ pip install -r requirements.txt
 
 If `pip` is not on PATH, use `python -m pip` instead of `pip`.
 
+Or just run:
+
+```bash
+bash setup.sh
+```
+
 ### Run live skeleton
 
 Requires `httpx` to be installed (provided via `requirements.txt`). API calls are stubs; this only exercises the async order submission path.
@@ -42,6 +48,21 @@ PY
 ```
 
 If you encounter `ModuleNotFoundError: httpx`, ensure dependencies are installed as above.
+
+### One-command helpers
+
+```bash
+bash run_demo.sh   # runs the demo pipeline
+bash run_live.sh   # runs the live-skeleton path (still stubbed API calls)
+```
+
+### Simple dashboard (demo)
+
+Run a lightweight Streamlit UI to visualize detected opportunities and trigger runs:
+
+```bash
+bash run_ui.sh
+```
 
 ## Project layout
 
