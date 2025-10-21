@@ -140,6 +140,7 @@ def detect_arbs_with_matcher(
     kalshi_quotes: Iterable[MarketQuote],
     polymarket_quotes: Iterable[MarketQuote],
     similarity_threshold: float = 0.78,
+    explicit_map: dict[str, str] | None = None,
 ) -> List[CrossExchangeArb]:
     """Detect cross-exchange arbs using fuzzy event matching.
 
@@ -165,16 +166,25 @@ def detect_arbs_with_matcher(
         unique_p_events.add(q.event)
 
     # Build fuzzy mapping from Kalshi -> best Polymarket event
-    matcher = EventMatcher(threshold=similarity_threshold)
+    matcher = EventMatcher(explicit_map=explicit_map or {}, threshold=similarity_threshold)
+    # The build_candidates in our matcher expects quotes; create lightweight quotes containing events
+    from app.core.models import MarketQuote as MQ
     candidates = matcher.build_candidates(
-        [MarketQuote("kalshi", "", e, "YES", 0.0, 0.0) for e in []],  # not used
-        [MarketQuote("polymarket", "", e, "YES", 0.0, 0.0) for e in []],  # not used
+        [MQ("kalshi", "", q.event, "YES", 0.0, 0.0) for q in kalshi_quotes],
+        [MQ("polymarket", "", q.event, "YES", 0.0, 0.0) for q in polymarket_quotes],
     )
-    # The build_candidates in our matcher expects quotes; improvise a local match:
+    # Also do a local fuzzy pass to build a mapping dict
     from app.utils.text import similarity
 
     mapping: dict[str, str] = {}
+    # Start with explicit mapping if provided
+    if explicit_map:
+        for k, v in explicit_map.items():
+            mapping[key_event(k)] = key_event(v)
+    # Add best fuzzy matches
     for ek in unique_k_events:
+        if key_event(ek) in mapping:
+            continue
         best_sim = -1.0
         best_ep = None
         for ep in unique_p_events:

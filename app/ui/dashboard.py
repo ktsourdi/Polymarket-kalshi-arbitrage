@@ -114,6 +114,9 @@ with st.sidebar:
     mode = st.radio("Mode", ["Detect only", "Run demo pipeline", "Run live-skeleton"], index=0)
     refresh = st.button("Refresh data", type="primary")
     st.caption("Demo uses randomized mocked quotes. Live fetch attempts real APIs.")
+    st.markdown("### Matching")
+    sim_thresh = st.slider("Fuzzy match threshold", min_value=0.6, max_value=0.95, value=0.8, step=0.01)
+    keyword = st.text_input("Keyword filter (optional)", value="")
 
     st.markdown("### Env status")
     kalshi_ok = bool(os.getenv("KALSHI_API_KEY"))
@@ -149,11 +152,19 @@ else:
         st.warning("Polymarket credentials not found. Proceeding with Kalshi-only live data; cross-exchange results will be empty until you add Polymarket creds.")
     kalshi, poly = load_quotes_live_sync()
 
+# Optional keyword filtering to increase overlap
+def _kw_ok(q):
+    if not keyword:
+        return True
+    return keyword.lower() in q.event.lower()
+kalshi = [q for q in kalshi if _kw_ok(q)]
+poly = [q for q in poly if _kw_ok(q)]
+
 tab1, tab2 = st.tabs(["Cross-Exchange", "Two-Buy"])
 with tab1:
     cross = detect_arbs(kalshi, poly)
     if not cross:
-        cross = detect_arbs_with_matcher(kalshi, poly, similarity_threshold=0.8)
+        cross = detect_arbs_with_matcher(kalshi, poly, similarity_threshold=sim_thresh)
     render_cross_arbs(cross)
 with tab2:
     two = detect_two_buy_arbs(kalshi, poly)
@@ -180,6 +191,7 @@ elif data_mode == "Live data (read-only)" and mode == "Run live-skeleton":
 
 # Diagnostics
 st.markdown("---")
+st.markdown("#### Diagnostics")
 def _sample(events, n=5):
     seen = []
     for e in events:
@@ -198,5 +210,7 @@ with col1:
 with col2:
     st.caption("Polymarket live quotes")
     st.write({"count": len(poly_events), "sample": _sample(poly_events)})
+
+# TODO: We could add a matched-pairs preview by running the matcher with a high threshold and listing top overlaps.
 
 
