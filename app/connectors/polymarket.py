@@ -4,6 +4,7 @@ from typing import List
 import os
 import json
 from datetime import datetime, timezone
+import asyncio
 
 import httpx
 
@@ -25,6 +26,7 @@ class PolymarketClient:
         self._markets_url = os.environ.get("POLYMARKET_MARKETS_URL", "https://gamma-api.polymarket.com/markets")
         # Fallback CLOB markets endpoint
         self._clob_markets_url = os.environ.get("POLYMARKET_CLOB_MARKETS_URL", f"{self.base_url.rstrip('/')}/markets")
+        self._orderbook_url = os.environ.get("POLYMARKET_ORDERBOOK_URL", f"{self.base_url.rstrip('/')}/orderbook")
 
     async def close(self):
         await self._client.aclose()
@@ -68,10 +70,16 @@ class PolymarketClient:
                 offset += len(batch)
             return items
 
-        # Try Gamma with active filter first; if empty, retry without filter
-        gamma_markets = await paginate(self._markets_url, {"active": "true"})
+        # Try Gamma with active filter and sort by most recently updated
+        gamma_markets = await paginate(
+            self._markets_url,
+            {"active": "true", "order": "updatedAt", "ascending": "false"},
+        )
         if not gamma_markets:
-            gamma_markets = await paginate(self._markets_url, {})
+            gamma_markets = await paginate(
+                self._markets_url,
+                {"order": "updatedAt", "ascending": "false"},
+            )
 
         markets.extend(gamma_markets)
 
@@ -117,11 +125,25 @@ class PolymarketClient:
         future_cutoff = now + timedelta(days=365)
 
         timed: List[dict] = []
+        include_no_date = os.environ.get("POLYMARKET_INCLUDE_NO_DATE", "0").lower() in {"1", "true", "yes"}
         for m in final:
-            dt = _parse_dt(m.get("endDateIso")) or _parse_dt(m.get("endDate"))
+            # Try multiple date sources for recency
+            dt = (
+                _parse_dt(m.get("endDateIso"))
+                or _parse_dt(m.get("endDate"))
+                or _parse_dt(m.get("updatedAt"))
+                or _parse_dt(m.get("createdAt"))
+            )
             if dt is None:
-                # If no date info, include (we'll rely on event matching later)
-                timed.append(m)
+                # Look into first event if present
+                evs = m.get("events") or []
+                if isinstance(evs, list) and evs:
+                    first = evs[0]
+                    if isinstance(first, dict):
+                        dt = _parse_dt(first.get("endDate")) or _parse_dt(first.get("updatedAt"))
+            if dt is None:
+                if include_no_date:
+                    timed.append(m)
                 continue
             if past_cutoff <= dt <= future_cutoff:
                 timed.append(m)
@@ -138,6 +160,7 @@ class PolymarketClient:
     async def fetch_quotes(self) -> List[MarketQuote]:
         markets = await self.fetch_markets()
         quotes: List[MarketQuote] = []
+        tokens_needed: List[tuple[str, str, str]] = []  # (event, outcome, tokenId)
         for m in markets:
             event = m.get("question") or m.get("title") or m.get("name") or ""
             size = float(m.get("liquidityNum") or m.get("liquidity") or 0)
@@ -200,6 +223,8 @@ class PolymarketClient:
                                 size=size,
                             )
                         )
+                        if not token_id:
+                            tokens_needed.append((event, outcome_name, token_id or ""))
                         mapped = True
 
             if mapped:
@@ -242,6 +267,67 @@ class PolymarketClient:
                         size=size,
                     )
                 )
+            # Track tokens we still need from orderbook
+            if tokens:
+                if len(tokens) >= 1 and not yes_price:
+                    tokens_needed.append((event, "YES", tokens[0]))
+                if len(tokens) >= 2 and not no_price:
+                    tokens_needed.append((event, "NO", tokens[1]))
+
+        # Fetch missing prices via orderbook with bounded concurrency
+        async def fetch_ob(token_id: str):
+            try:
+                resp = await self._client.get(self._orderbook_url, params={"tokenId": token_id})
+                resp.raise_for_status()
+                data = resp.json()
+                ob = data.get("orderbook") or {}
+                yes_arr = ob.get("yes_dollars") or ob.get("yes") or []
+                no_arr = ob.get("no_dollars") or ob.get("no") or []
+                def top(arr):
+                    if not arr:
+                        return None
+                    first = arr[0]
+                    if isinstance(first, list) and first:
+                        return float(first[0])
+                    try:
+                        return float(first)
+                    except Exception:
+                        return None
+                return top(yes_arr), top(no_arr)
+            except Exception:
+                return None
+
+        sem = asyncio.Semaphore(int(os.environ.get("POLYMARKET_OB_CONCURRENCY", "8")))
+
+        async def worker(ev: str, outcome: str, tok: str):
+            if not tok:
+                return None
+            async with sem:
+                res = await fetch_ob(tok)
+                return (ev, outcome, tok, res)
+
+        if tokens_needed:
+            results = await asyncio.gather(*[worker(e, o, t) for e, o, t in tokens_needed], return_exceptions=True)
+            for r in results:
+                if not r or isinstance(r, Exception):
+                    continue
+                ev, outcome, tok, res = r
+                if not res:
+                    continue
+                y, n = res
+                price = y if outcome == "YES" else n
+                if price:
+                    quotes.append(
+                        MarketQuote(
+                            exchange="polymarket",
+                            market_id=str(tok),
+                            event=ev,
+                            outcome=outcome,
+                            price=float(price),
+                            size=0.0,
+                        )
+                    )
+
         return quotes
 
     async def place_limit_order(

@@ -33,7 +33,9 @@ def detect_arbs(
         k = k_by_event[event_key]
         p = p_by_event[event_key]
         if "YES" in k and "NO" in p:
-            edge_bps = compute_edge_bps(k["YES"].price, p["NO"].price) - settings.fees.taker_bps
+            # Account for fees and slippage buffers on both legs
+            total_bps = settings.fees.taker_bps + settings.risk.slippage_bps
+            edge_bps = compute_edge_bps(k["YES"].price, p["NO"].price) - total_bps
             if edge_bps > 0:
                 max_notional = min(k["YES"].size * k["YES"].price, p["NO"].size * (1 - p["NO"].price), settings.risk.max_notional_per_leg)
                 gross_profit = edge_bps / 10000.0 * max_notional
@@ -49,7 +51,7 @@ def detect_arbs(
                         )
                     )
         if "YES" in p and "NO" in k:
-            edge_bps = compute_edge_bps(p["YES"].price, k["NO"].price) - settings.fees.taker_bps
+            edge_bps = compute_edge_bps(p["YES"].price, k["NO"].price) - total_bps
             if edge_bps > 0:
                 max_notional = min(p["YES"].size * p["YES"].price, k["NO"].size * (1 - k["NO"].price), settings.risk.max_notional_per_leg)
                 gross_profit = edge_bps / 10000.0 * max_notional
@@ -82,6 +84,7 @@ def detect_two_buy_arbs(
 
     results: List[TwoBuyArb] = []
     taker_fee = settings.fees.taker_bps / 10000.0
+    slip_fee = settings.risk.slippage_bps / 10000.0
     for event in set(k_by_event.keys()) & set(p_by_event.keys()):
         k = k_by_event[event]
         p = p_by_event[event]
@@ -89,7 +92,7 @@ def detect_two_buy_arbs(
         if "YES" in k and "NO" in p:
             sum_price = k["YES"].price + p["NO"].price
             # Fees scale with notional, so subtract fee on each leg proportional to price
-            edge = 1.0 - sum_price - taker_fee * (k["YES"].price + p["NO"].price)
+            edge = 1.0 - sum_price - (taker_fee + slip_fee) * (k["YES"].price + p["NO"].price)
             if edge > 0:
                 # Cap by available size and per-leg notional limits (convert $ cap to contracts)
                 cap_yes = settings.risk.max_notional_per_leg / max(k["YES"].price, 1e-9)
@@ -110,7 +113,7 @@ def detect_two_buy_arbs(
         # Case B: buy YES on Polymarket, buy NO on Kalshi
         if "YES" in p and "NO" in k:
             sum_price = p["YES"].price + k["NO"].price
-            edge = 1.0 - sum_price - taker_fee * (p["YES"].price + k["NO"].price)
+            edge = 1.0 - sum_price - (taker_fee + slip_fee) * (p["YES"].price + k["NO"].price)
             if edge > 0:
                 cap_yes = settings.risk.max_notional_per_leg / max(p["YES"].price, 1e-9)
                 cap_no = settings.risk.max_notional_per_leg / max(k["NO"].price, 1e-9)

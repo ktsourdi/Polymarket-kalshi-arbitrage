@@ -16,6 +16,7 @@ import streamlit as st
 
 from app.connectors.demo import fetch_kalshi_demo, fetch_polymarket_demo
 from app.core.arb import detect_arbs, detect_two_buy_arbs, detect_arbs_with_matcher
+from app.config.settings import settings
 from app.core.models import CrossExchangeArb, TwoBuyArb
 
 
@@ -119,6 +120,21 @@ with st.sidebar:
     poly_ok = bool(os.getenv("POLYMARKET_PRIVATE_KEY") or os.getenv("POLYMARKET_API_KEY"))
     st.write(f"Kalshi: {'OK' if kalshi_ok else 'missing'}")
     st.write(f"Polymarket: {'OK' if poly_ok else 'not found'}")
+
+    st.markdown("### Risk / Fees")
+    taker_bps = st.number_input("Taker fee (bps)", min_value=0.0, max_value=200.0, value=float(settings.fees.taker_bps), step=1.0)
+    slippage_bps = st.number_input("Slippage buffer (bps)", min_value=0.0, max_value=200.0, value=float(settings.risk.slippage_bps), step=1.0)
+    max_notional = st.number_input("Max notional per leg ($)", min_value=10.0, max_value=100000.0, value=float(settings.risk.max_notional_per_leg), step=10.0)
+    min_profit = st.number_input("Min profit ($)", min_value=0.0, max_value=1000.0, value=float(settings.risk.min_profit_usd), step=0.5)
+    if st.button("Apply settings"):
+        # Apply live settings and clear caches so detection recomputes
+        settings.fees.taker_bps = float(taker_bps)
+        settings.risk.slippage_bps = float(slippage_bps)
+        settings.risk.max_notional_per_leg = float(max_notional)
+        settings.risk.min_profit_usd = float(min_profit)
+        load_quotes_sync.clear()
+        if 'load_quotes_live_sync' in globals():
+            load_quotes_live_sync.clear()
 
 if refresh:
     load_quotes_sync.clear()
