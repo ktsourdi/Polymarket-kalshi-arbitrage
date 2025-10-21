@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List
 import os
+import json
 
 import httpx
 
@@ -19,7 +20,10 @@ class PolymarketClient:
         self.api_key = api_key
         self._client = httpx.AsyncClient(timeout=15)
         # Public markets endpoint (read-only)
+        # Primary public markets endpoint (Gamma API)
         self._markets_url = os.environ.get("POLYMARKET_MARKETS_URL", "https://gamma-api.polymarket.com/markets")
+        # Fallback CLOB markets endpoint
+        self._clob_markets_url = os.environ.get("POLYMARKET_CLOB_MARKETS_URL", f"{self.base_url.rstrip('/')}/markets")
 
     async def close(self):
         await self._client.aclose()
@@ -29,61 +33,116 @@ class PolymarketClient:
 
         Falls back to an empty list on error. This does not require authentication.
         """
-        try:
-            resp = await self._client.get(self._markets_url, params={"active": "true"})
-            resp.raise_for_status()
-            data = resp.json()
-            # Some deployments return an object with a "markets" key, others a list
-            if isinstance(data, dict) and "markets" in data:
-                return list(data.get("markets") or [])
-            if isinstance(data, list):
-                return data
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to fetch Polymarket markets: %s", exc)
-        return []
+        async def _fetch(url: str, params: dict | None = None) -> List[dict]:
+            try:
+                resp = await self._client.get(url, params=params or {})
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, dict):
+                    for key in ("markets", "data", "result"):
+                        if key in data and isinstance(data[key], list):
+                            return list(data[key])
+                if isinstance(data, list):
+                    return data
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Polymarket markets fetch failed at %s: %s", url, exc)
+            return []
+
+        # Try Gamma API first, then CLOB fallback
+        markets = await _fetch(self._markets_url, params={"limit": 1000})
+        if not markets:
+            markets = await _fetch(self._clob_markets_url, params={"limit": 1000})
+        return markets
 
     async def fetch_quotes(self) -> List[MarketQuote]:
         markets = await self.fetch_markets()
         quotes: List[MarketQuote] = []
         for m in markets:
             event = m.get("question") or m.get("title") or m.get("name") or ""
-            # Market may have per-outcome token info; try to extract prices and IDs
-            yes_price = None
+            size = float(m.get("liquidityNum") or m.get("liquidity") or 0)
+
+            # Extract token ids
+            token_field = m.get("clobTokenIds") or m.get("clob_token_ids") or m.get("tokenIds")
+            tokens: List[str] = []
+            if isinstance(token_field, list):
+                tokens = [str(t) for t in token_field]
+            elif isinstance(token_field, str):
+                try:
+                    maybe_list = json.loads(token_field)
+                    if isinstance(maybe_list, list):
+                        tokens = [str(t) for t in maybe_list]
+                    else:
+                        tokens = [s for s in token_field.replace("[", "").replace("]", "").split(",") if s.strip()]
+                        tokens = [t.strip() for t in tokens]
+                except Exception:
+                    tokens = [s for s in token_field.replace("[", "").replace("]", "").split(",") if s.strip()]
+                    tokens = [t.strip() for t in tokens]
+
+            # Outcomes and prices arrays
+            outcomes = m.get("shortOutcomes") or m.get("outcomes") or []
+            if isinstance(outcomes, str):
+                try:
+                    outcomes = json.loads(outcomes)
+                except Exception:
+                    outcomes = [s.strip() for s in outcomes.split(",") if s.strip()]
+            prices = m.get("outcomePrices") or []
+            if isinstance(prices, str):
+                try:
+                    prices = json.loads(prices)
+                except Exception:
+                    prices = [s.strip() for s in prices.split(",") if s.strip()]
+
+            def to_price(v) -> float:
+                try:
+                    p = float(v)
+                except Exception:
+                    return 0.0
+                return p / 100.0 if p > 1.0 else p
+
+            # If arrays align, map directly
+            mapped = False
+            if isinstance(outcomes, list) and outcomes and isinstance(prices, list) and len(prices) == len(outcomes):
+                for idx, name in enumerate(outcomes):
+                    outcome_name = str(name).upper()
+                    price = to_price(prices[idx])
+                    token_id = None
+                    if tokens and idx < len(tokens):
+                        token_id = tokens[idx]
+                    if outcome_name in {"YES", "NO"} and price:
+                        quotes.append(
+                            MarketQuote(
+                                exchange="polymarket",
+                                market_id=str(token_id or f"{m.get('id')}-{outcome_name}"),
+                                event=event,
+                                outcome=outcome_name,
+                                price=price,
+                                size=size,
+                            )
+                        )
+                        mapped = True
+
+            if mapped:
+                continue
+
+            # Fallback: use bestAsk/bestBid if present for YES; derive NO from 1-yes if we must
+            yes_price = m.get("bestAsk") or m.get("yesPrice") or None
             no_price = None
-            yes_token = None
-            no_token = None
-            size = float(m.get("liquidity", 0) or 0)
-
-            # Common shapes seen in Gamma API payloads
-            outcomes = m.get("outcomes") or m.get("contracts") or []
-            if isinstance(outcomes, list) and outcomes:
-                for o in outcomes:
-                    o_name = (o.get("name") or o.get("outcome") or "").upper()
-                    token_id = o.get("tokenId") or o.get("token_id") or o.get("id")
-                    # Prefer best ask as a proxy for price to buy
-                    best_ask = o.get("bestAsk") or o.get("best_ask")
-                    last_price = o.get("lastPrice") or o.get("last_price")
-                    price = best_ask if best_ask is not None else last_price
-                    if price is not None:
-                        price = float(price)
-                    if o_name == "YES":
-                        yes_price = price
-                        yes_token = token_id
-                    elif o_name == "NO":
-                        no_price = price
-                        no_token = token_id
-
-            # Some payloads may include direct fields
-            yes_price = float(m.get("yes_price", yes_price or 0) or 0)
-            no_price = float(m.get("no_price", no_price or 0) or 0)
-            yes_token = yes_token or m.get("yesTokenId") or m.get("yes_token_id") or m.get("id")
-            no_token = no_token or m.get("noTokenId") or m.get("no_token_id") or m.get("id")
+            if yes_price is not None:
+                yes_price = to_price(yes_price)
+            # Try to find an explicit NO price
+            if isinstance(outcomes, list) and "NO" in [str(x).upper() for x in outcomes] and isinstance(prices, list):
+                try:
+                    idx_no = [str(x).upper() for x in outcomes].index("NO")
+                    no_price = to_price(prices[idx_no])
+                except Exception:
+                    no_price = None
 
             if yes_price:
+                token = tokens[0] if tokens else m.get("id")
                 quotes.append(
                     MarketQuote(
                         exchange="polymarket",
-                        market_id=str(yes_token),
+                        market_id=str(token),
                         event=event,
                         outcome="YES",
                         price=yes_price,
@@ -91,10 +150,11 @@ class PolymarketClient:
                     )
                 )
             if no_price:
+                token = tokens[1] if len(tokens) > 1 else m.get("id")
                 quotes.append(
                     MarketQuote(
                         exchange="polymarket",
-                        market_id=str(no_token),
+                        market_id=str(token),
                         event=event,
                         outcome="NO",
                         price=no_price,
