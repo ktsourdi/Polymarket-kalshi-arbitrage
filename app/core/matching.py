@@ -4,7 +4,7 @@ from collections import defaultdict
 from typing import Dict, Iterable, List, Tuple
 
 from app.core.models import MarketQuote, MatchCandidate
-from app.utils.text import similarity
+from app.utils.text import similarity, extract_numbers_window
 
 
 class EventMatcher:
@@ -28,7 +28,13 @@ class EventMatcher:
             best_sim = -1.0
             best_event_pm = None
             for ep in by_event_p.keys():
+                # Prefer explicit mapping when provided
                 s = 1.0 if target and ep.lower() == target.lower() else similarity(ek, ep)
+                # If both sides have numeric windows (e.g., dates, thresholds), enforce equality
+                nums_k = extract_numbers_window(ek)
+                nums_p = extract_numbers_window(ep)
+                if nums_k and nums_p and nums_k != nums_p:
+                    continue
                 if s > best_sim:
                     best_sim = s
                     best_event_pm = ep

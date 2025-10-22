@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict
 from typing import List
+import json
 from pathlib import Path
 import sys
 import os
@@ -15,9 +16,10 @@ if str(PROJECT_ROOT) not in sys.path:
 import streamlit as st
 
 from app.connectors.demo import fetch_kalshi_demo, fetch_polymarket_demo
-from app.core.arb import detect_arbs, detect_two_buy_arbs, detect_arbs_with_matcher
+from app.core.arb import detect_arbs, detect_two_buy_arbs, detect_arbs_with_matcher, compute_edge_bps
 from app.config.settings import settings
-from app.core.models import CrossExchangeArb, TwoBuyArb
+from app.core.models import CrossExchangeArb, TwoBuyArb, MarketQuote as MQ
+from app.core.matching import EventMatcher
 
 
 st.set_page_config(page_title="Polymarket–Kalshi Arbitrage", layout="wide")
@@ -117,6 +119,17 @@ with st.sidebar:
     st.markdown("### Matching")
     sim_thresh = st.slider("Fuzzy match threshold", min_value=0.6, max_value=0.95, value=0.8, step=0.01)
     keyword = st.text_input("Keyword filter (optional)", value="")
+    alias_file = st.file_uploader("Alias map JSON (Kalshi → Polymarket)", type=["json"])
+    explicit_map: dict[str, str] | None = None
+    if alias_file is not None:
+        try:
+            explicit_map = json.load(alias_file)
+            if not isinstance(explicit_map, dict):
+                st.warning("Alias map must be a JSON object of Kalshi→Polymarket event strings.")
+                explicit_map = {}
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Failed to parse alias map: {e}")
+            explicit_map = {}
 
     st.markdown("### Env status")
     kalshi_ok = bool(os.getenv("KALSHI_API_KEY"))
@@ -164,7 +177,12 @@ tab1, tab2 = st.tabs(["Cross-Exchange", "Two-Buy"])
 with tab1:
     cross = detect_arbs(kalshi, poly)
     if not cross:
-        cross = detect_arbs_with_matcher(kalshi, poly, similarity_threshold=sim_thresh)
+        cross = detect_arbs_with_matcher(
+            kalshi,
+            poly,
+            similarity_threshold=sim_thresh,
+            explicit_map=explicit_map,
+        )
     render_cross_arbs(cross)
 with tab2:
     two = detect_two_buy_arbs(kalshi, poly)
@@ -211,6 +229,57 @@ with col2:
     st.caption("Polymarket live quotes")
     st.write({"count": len(poly_events), "sample": _sample(poly_events)})
 
-# TODO: We could add a matched-pairs preview by running the matcher with a high threshold and listing top overlaps.
+st.markdown("#### Top candidate pairs (fuzzy matching)")
+try:
+    matcher = EventMatcher(explicit_map=explicit_map or {}, threshold=sim_thresh)
+    # Build lightweight quotes for candidate generation
+    cands = matcher.build_candidates(
+        [MQ("kalshi", "", q.event, "YES", 0.0, 0.0) for q in kalshi],
+        [MQ("polymarket", "", q.event, "YES", 0.0, 0.0) for q in poly],
+    )
+    # Build price lookup by event/outcome for quick edge preview
+    from collections import defaultdict
+    def _by_event(quotes: List[MQ]):
+        d = defaultdict(dict)
+        for q in quotes:
+            d[q.event][q.outcome] = q
+        return d
+    k_by = _by_event(kalshi)
+    p_by = _by_event(poly)
+
+    # Compute simple edge preview for each candidate if outcomes available
+    rows = []
+    total_bps = settings.fees.taker_bps + settings.risk.slippage_bps
+    for c in sorted(cands, key=lambda x: x.similarity, reverse=True)[:20]:
+        try:
+            ek, ep = c.event_key.split(" <-> ", 1)
+        except ValueError:
+            ek, ep = c.event_key, ""
+        kq = k_by.get(ek, {})
+        pq = p_by.get(ep, {})
+        edge_a = None
+        edge_b = None
+        if "YES" in kq and "NO" in pq:
+            edge_a = compute_edge_bps(kq["YES"].price, pq["NO"].price) - total_bps
+        if "YES" in pq and "NO" in kq:
+            edge_b = compute_edge_bps(pq["YES"].price, kq["NO"].price) - total_bps
+        rows.append(
+            {
+                "pair": c.event_key,
+                "similarity": round(float(c.similarity), 3),
+                "K YES": round(kq.get("YES").price, 3) if "YES" in kq else None,
+                "P NO": round(pq.get("NO").price, 3) if "NO" in pq else None,
+                "edge_bps K_yes+P_no": round(edge_a, 1) if edge_a is not None else None,
+                "P YES": round(pq.get("YES").price, 3) if "YES" in pq else None,
+                "K NO": round(kq.get("NO").price, 3) if "NO" in kq else None,
+                "edge_bps P_yes+K_no": round(edge_b, 1) if edge_b is not None else None,
+            }
+        )
+    if rows:
+        st.dataframe(rows, width='stretch', hide_index=True)
+    else:
+        st.info("No candidate pairs found at current threshold. Try lowering the threshold or providing an alias map.")
+except Exception as e:  # noqa: BLE001
+    st.warning(f"Diagnostics error: {e}")
 
 
