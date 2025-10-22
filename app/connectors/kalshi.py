@@ -42,7 +42,8 @@ class KalshiClient:
             if self.bearer_token:
                 headers["Authorization"] = f"Bearer {self.bearer_token}"
             cursor = None
-            max_pages = int(os.environ.get("KALSHI_MAX_PAGES", "2"))
+            # Fetch more pages by default to improve coverage. Can override via env.
+            max_pages = int(os.environ.get("KALSHI_MAX_PAGES", "10"))
             page = 0
             for _ in range(max_pages):  # soft cap to avoid huge downloads
                 params = {"limit": int(os.environ.get("KALSHI_PAGE_LIMIT", "1000")), "status": "active"}
