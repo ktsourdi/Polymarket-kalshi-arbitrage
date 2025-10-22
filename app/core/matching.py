@@ -4,7 +4,7 @@ from collections import defaultdict
 from typing import Dict, Iterable, List, Tuple
 
 from app.core.models import MarketQuote, MatchCandidate
-from app.utils.text import similarity, extract_numbers_window
+from app.utils.text import similarity, extract_numbers_window, extract_entity_tokens
 
 
 class EventMatcher:
@@ -34,6 +34,11 @@ class EventMatcher:
                 nums_k = extract_numbers_window(ek)
                 nums_p = extract_numbers_window(ep)
                 if nums_k and nums_p and nums_k != nums_p:
+                    continue
+                # Require some entity overlap when possible
+                ents_k = extract_entity_tokens(ek)
+                ents_p = extract_entity_tokens(ep)
+                if ents_k and ents_p and not (ents_k & ents_p):
                     continue
                 if s > best_sim:
                     best_sim = s
