@@ -175,13 +175,15 @@ def detect_arbs_with_matcher(
     )
     # Also do a local fuzzy pass to build a mapping dict
     from app.utils.text import similarity
+    from app.utils.text import extract_numbers_window
 
     mapping: dict[str, str] = {}
     # Start with explicit mapping if provided
     if explicit_map:
         for k, v in explicit_map.items():
             mapping[key_event(k)] = key_event(v)
-    # Add best fuzzy matches
+    # Add best fuzzy matches with a number-aware guard: if both events contain
+    # numeric windows (e.g., years, thresholds), only accept if those windows match.
     for ek in unique_k_events:
         if key_event(ek) in mapping:
             continue
@@ -189,6 +191,12 @@ def detect_arbs_with_matcher(
         best_ep = None
         for ep in unique_p_events:
             s = similarity(ek, ep)
+            # Number-aware guard
+            nums_k = extract_numbers_window(ek)
+            nums_p = extract_numbers_window(ep)
+            if nums_k and nums_p and nums_k != nums_p:
+                # Require matching numeric windows when both sides provide them
+                continue
             if s > best_sim:
                 best_sim = s
                 best_ep = ep
@@ -197,6 +205,9 @@ def detect_arbs_with_matcher(
 
     # For mapped pairs, compute arbs like in detect_arbs
     arbs: List[CrossExchangeArb] = []
+    # Account for both taker and slippage bps (consistent with detect_arbs)
+    total_bps = settings.fees.taker_bps + settings.risk.slippage_bps
+
     for ek_key, ep_key in mapping.items():
         k = k_by_event.get(ek_key)
         p = p_by_event.get(ep_key)
@@ -204,7 +215,7 @@ def detect_arbs_with_matcher(
             continue
         # Case K YES vs P NO
         if "YES" in k and "NO" in p:
-            edge_bps = compute_edge_bps(k["YES"].price, p["NO"].price) - settings.fees.taker_bps
+            edge_bps = compute_edge_bps(k["YES"].price, p["NO"].price) - total_bps
             if edge_bps > 0:
                 max_notional = min(
                     k["YES"].size * k["YES"].price,
@@ -225,7 +236,7 @@ def detect_arbs_with_matcher(
                     )
         # Case P YES vs K NO
         if "YES" in p and "NO" in k:
-            edge_bps = compute_edge_bps(p["YES"].price, k["NO"].price) - settings.fees.taker_bps
+            edge_bps = compute_edge_bps(p["YES"].price, k["NO"].price) - total_bps
             if edge_bps > 0:
                 max_notional = min(
                     p["YES"].size * p["YES"].price,
