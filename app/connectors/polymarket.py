@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, AsyncIterator, Tuple
 import os
 import json
 from datetime import datetime, timezone
@@ -31,10 +31,10 @@ class PolymarketClient:
     async def close(self):
         await self._client.aclose()
 
-    async def fetch_markets(self) -> List[dict]:
-        """Fetch active markets from Polymarket Gamma API (read-only).
+    async def _yield_pages(self, url: str, base_params: dict | None = None, *, page_limit: int | None = None, max_pages: int | None = None) -> AsyncIterator[List[dict]]:
+        """Yield raw market pages from a paginated endpoint (offset/limit).
 
-        Falls back to an empty list on error. This does not require authentication.
+        This is a simple offset-based paginator that yields each page as it arrives.
         """
         async def _fetch(url: str, params: dict | None = None) -> List[dict]:
             try:
@@ -51,74 +51,56 @@ class PolymarketClient:
                 logger.warning("Polymarket markets fetch failed at %s: %s", url, exc)
             return []
 
-        # Try Gamma API first, then CLOB fallback
-        markets: List[dict] = []
+        offset = 0
+        eff_page_limit = int(page_limit or int(os.environ.get("POLYMARKET_PAGE_LIMIT", "1000")))
+        eff_max_pages = int(max_pages or int(os.environ.get("POLYMARKET_MAX_PAGES", "3")))
+        for _ in range(eff_max_pages):
+            params = {"limit": eff_page_limit, "offset": offset}
+            if base_params:
+                params.update(base_params)
+            batch = await _fetch(url, params=params)
+            if not batch:
+                break
+            yield batch
+            if len(batch) < eff_page_limit:
+                break
+            offset += len(batch)
 
-        async def paginate(url: str, base_params: dict) -> List[dict]:
-            items: List[dict] = []
-            offset = 0
-            max_pages = int(os.environ.get("POLYMARKET_MAX_PAGES", "3"))
-            for _ in range(max_pages):
-                params = {"limit": int(os.environ.get("POLYMARKET_PAGE_LIMIT", "1000")), "offset": offset}
-                params.update(base_params or {})
-                batch = await _fetch(url, params=params)
-                if not batch:
-                    break
-                items.extend(batch)
-                if len(batch) < int(os.environ.get("POLYMARKET_PAGE_LIMIT", "1000")):
-                    break
-                offset += len(batch)
-            return items
+    @staticmethod
+    def _is_live(m: dict) -> bool:
+        # Treat missing fields as unknown/okay; only exclude explicit negatives
+        if bool(m.get("archived")):
+            return False
+        if m.get("closed") is True:
+            return False
+        if m.get("active") is False:
+            return False
+        return True
 
-        # Try Gamma with active filter and sort by most recently updated
-        gamma_markets = await paginate(
-            self._markets_url,
-            {"active": "true", "order": "updatedAt", "ascending": "false"},
-        )
-        if not gamma_markets:
-            gamma_markets = await paginate(
-                self._markets_url,
-                {"order": "updatedAt", "ascending": "false"},
-            )
+    @staticmethod
+    def _parse_dt(value: str | None) -> datetime | None:
+        if not value or not isinstance(value, str):
+            return None
+        try:
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
+            dt = datetime.fromisoformat(value)
+            # Ensure timezone-aware (UTC) for all comparisons
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt
+        except Exception:
+            return None
 
-        markets.extend(gamma_markets)
-
-        # Fallback to CLOB markets if still nothing
-        if not markets:
-            clob_markets = await paginate(self._clob_markets_url, {})
-            markets.extend(clob_markets)
+    def _filter_and_time_window(self, markets: List[dict]) -> List[dict]:
         # Basic client-side filtering to avoid stale/historical markets
-        def _is_live(m: dict) -> bool:
-            # Treat missing fields as unknown/okay; only exclude explicit negatives
-            if bool(m.get("archived")):
-                return False
-            if m.get("closed") is True:
-                return False
-            if m.get("active") is False:
-                return False
-            return True
-
         raw_count = len(markets)
-        filtered = [m for m in markets if _is_live(m)]
-        # If filtering nukes everything but we did receive data, return raw so we can inspect
+        filtered = [m for m in markets if self._is_live(m)]
         final = filtered if filtered or raw_count == 0 else markets
-        # Date filter: keep reasonably current markets (past 30d to next 365d)
-        def _parse_dt(value: str | None) -> datetime | None:
-            if not value or not isinstance(value, str):
-                return None
-            try:
-                if value.endswith("Z"):
-                    value = value[:-1] + "+00:00"
-                dt = datetime.fromisoformat(value)
-                # Ensure timezone-aware (UTC) for all comparisons
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                else:
-                    dt = dt.astimezone(timezone.utc)
-                return dt
-            except Exception:
-                return None
 
+        # Date filter: keep reasonably current markets (past 30d to next 365d)
         now = datetime.now(timezone.utc)
         from datetime import timedelta
         past_cutoff = now - timedelta(days=30)
@@ -129,10 +111,10 @@ class PolymarketClient:
         for m in final:
             # Try multiple date sources for recency
             dt = (
-                _parse_dt(m.get("endDateIso"))
-                or _parse_dt(m.get("endDate"))
-                or _parse_dt(m.get("updatedAt"))
-                or _parse_dt(m.get("createdAt"))
+                self._parse_dt(m.get("endDateIso"))
+                or self._parse_dt(m.get("endDate"))
+                or self._parse_dt(m.get("updatedAt"))
+                or self._parse_dt(m.get("createdAt"))
             )
             if dt is None:
                 # Look into first event if present
@@ -140,27 +122,22 @@ class PolymarketClient:
                 if isinstance(evs, list) and evs:
                     first = evs[0]
                     if isinstance(first, dict):
-                        dt = _parse_dt(first.get("endDate")) or _parse_dt(first.get("updatedAt"))
+                        dt = self._parse_dt(first.get("endDate")) or self._parse_dt(first.get("updatedAt"))
             if dt is None:
                 if include_no_date:
                     timed.append(m)
                 continue
             if past_cutoff <= dt <= future_cutoff:
                 timed.append(m)
-
-        logger.info(
-            "Polymarket markets fetched: raw=%d, post-filter=%d (returning=%d, date-window=%d)",
-            raw_count,
-            len(filtered),
-            len(final),
-            len(timed),
-        )
         return timed
 
-    async def fetch_quotes(self) -> List[MarketQuote]:
-        markets = await self.fetch_markets()
+    def _markets_to_quotes(self, markets: List[dict]) -> Tuple[List[MarketQuote], List[tuple[str, str, str]]]:
+        """Convert a list of market dicts into quotes and a list of token fetches needed.
+
+        Returns (quotes, tokens_needed) where tokens_needed are (event, outcome, tokenId).
+        """
         quotes: List[MarketQuote] = []
-        tokens_needed: List[tuple[str, str, str]] = []  # (event, outcome, tokenId)
+        tokens_needed: List[tuple[str, str, str]] = []
         for m in markets:
             event = m.get("question") or m.get("title") or m.get("name") or ""
             size = float(m.get("liquidityNum") or m.get("liquidity") or 0)
@@ -203,7 +180,6 @@ class PolymarketClient:
                     return 0.0
                 return p / 100.0 if p > 1.0 else p
 
-            # If arrays align, map directly
             mapped = False
             if isinstance(outcomes, list) and outcomes and isinstance(prices, list) and len(prices) == len(outcomes):
                 for idx, name in enumerate(outcomes):
@@ -252,7 +228,11 @@ class PolymarketClient:
             yes_price = m.get("bestAsk") or m.get("yesPrice") or None
             no_price = None
             if yes_price is not None:
-                yes_price = to_price(yes_price)
+                try:
+                    yes_price = float(yes_price)
+                except Exception:
+                    yes_price = to_price(yes_price)
+                yes_price = float(yes_price)
             # Try to find an explicit NO price
             if isinstance(outcomes, list) and "NO" in [str(x).upper() for x in outcomes] and isinstance(prices, list):
                 try:
@@ -269,7 +249,7 @@ class PolymarketClient:
                         market_id=str(token),
                         event=event,
                         outcome="YES",
-                        price=yes_price,
+                        price=float(yes_price),
                         size=size,
                     )
                 )
@@ -281,7 +261,7 @@ class PolymarketClient:
                         market_id=str(token),
                         event=event,
                         outcome="NO",
-                        price=no_price,
+                        price=float(no_price),
                         size=size,
                     )
                 )
@@ -291,61 +271,186 @@ class PolymarketClient:
                     tokens_needed.append((event, "YES", tokens[0]))
                 if len(tokens) >= 2 and not no_price:
                     tokens_needed.append((event, "NO", tokens[1]))
+        return quotes, tokens_needed
 
-        # Fetch missing prices via orderbook with bounded concurrency
-        async def fetch_ob(token_id: str):
-            try:
-                resp = await self._client.get(self._orderbook_url, params={"tokenId": token_id})
-                resp.raise_for_status()
-                data = resp.json()
-                ob = data.get("orderbook") or {}
-                yes_arr = ob.get("yes_dollars") or ob.get("yes") or []
-                no_arr = ob.get("no_dollars") or ob.get("no") or []
-                def top(arr):
-                    if not arr:
+    async def _fetch_orderbook_prices(self, token_id: str):
+        try:
+            resp = await self._client.get(self._orderbook_url, params={"tokenId": token_id})
+            resp.raise_for_status()
+            data = resp.json()
+            ob = data.get("orderbook") or {}
+            yes_arr = ob.get("yes_dollars") or ob.get("yes") or []
+            no_arr = ob.get("no_dollars") or ob.get("no") or []
+            def top(arr):
+                if not arr:
+                    return None
+                first = arr[0]
+                if isinstance(first, list) and first:
+                    return float(first[0])
+                try:
+                    return float(first)
+                except Exception:
+                    return None
+            return top(yes_arr), top(no_arr)
+        except Exception:
+            return None
+
+    async def iter_quotes(self, *, max_pages: int | None = None, page_limit: int | None = None) -> AsyncIterator[List[MarketQuote]]:
+        """Yield Polymarket quotes page-by-page with filtering and orderbook fill-ins.
+
+        This avoids loading all markets into memory at once.
+        """
+        any_emitted = False
+        # Try Gamma API first (active markets preferred)
+        async for raw_page in self._yield_pages(self._markets_url, {"active": "true", "order": "updatedAt", "ascending": "false"}, page_limit=page_limit, max_pages=max_pages):
+            timed = self._filter_and_time_window(raw_page)
+            if not timed:
+                continue
+            quotes, tokens_needed = self._markets_to_quotes(timed)
+            # Fetch missing via orderbook for this page
+            if tokens_needed:
+                sem = asyncio.Semaphore(int(os.environ.get("POLYMARKET_OB_CONCURRENCY", "8")))
+                async def worker(ev: str, outcome: str, tok: str):
+                    if not tok:
                         return None
-                    first = arr[0]
-                    if isinstance(first, list) and first:
-                        return float(first[0])
-                    try:
-                        return float(first)
-                    except Exception:
-                        return None
-                return top(yes_arr), top(no_arr)
-            except Exception:
-                return None
-
-        sem = asyncio.Semaphore(int(os.environ.get("POLYMARKET_OB_CONCURRENCY", "8")))
-
-        async def worker(ev: str, outcome: str, tok: str):
-            if not tok:
-                return None
-            async with sem:
-                res = await fetch_ob(tok)
-                return (ev, outcome, tok, res)
-
-        if tokens_needed:
-            results = await asyncio.gather(*[worker(e, o, t) for e, o, t in tokens_needed], return_exceptions=True)
-            for r in results:
-                if not r or isinstance(r, Exception):
-                    continue
-                ev, outcome, tok, res = r
-                if not res:
-                    continue
-                y, n = res
-                price = y if outcome == "YES" else n
-                if price:
-                    quotes.append(
-                        MarketQuote(
-                            exchange="polymarket",
-                            market_id=str(tok),
-                            event=ev,
-                            outcome=outcome,
-                            price=float(price),
-                            size=0.0,
+                    async with sem:
+                        res = await self._fetch_orderbook_prices(tok)
+                        return (ev, outcome, tok, res)
+                results = await asyncio.gather(*[worker(e, o, t) for e, o, t in tokens_needed], return_exceptions=True)
+                for r in results:
+                    if not r or isinstance(r, Exception):
+                        continue
+                    ev, outcome, tok, res = r
+                    if not res:
+                        continue
+                    y, n = res
+                    price = y if outcome == "YES" else n
+                    if price:
+                        quotes.append(
+                            MarketQuote(
+                                exchange="polymarket",
+                                market_id=str(tok),
+                                event=ev,
+                                outcome=outcome,
+                                price=float(price),
+                                size=0.0,
+                            )
                         )
-                    )
+            any_emitted = True
+            yield quotes
 
+        # If nothing emitted, try Gamma without active filter
+        if not any_emitted:
+            async for raw_page in self._yield_pages(self._markets_url, {"order": "updatedAt", "ascending": "false"}, page_limit=page_limit, max_pages=max_pages):
+                timed = self._filter_and_time_window(raw_page)
+                if not timed:
+                    continue
+                quotes, tokens_needed = self._markets_to_quotes(timed)
+                if tokens_needed:
+                    sem = asyncio.Semaphore(int(os.environ.get("POLYMARKET_OB_CONCURRENCY", "8")))
+                    async def worker(ev: str, outcome: str, tok: str):
+                        if not tok:
+                            return None
+                        async with sem:
+                            res = await self._fetch_orderbook_prices(tok)
+                            return (ev, outcome, tok, res)
+                    results = await asyncio.gather(*[worker(e, o, t) for e, o, t in tokens_needed], return_exceptions=True)
+                    for r in results:
+                        if not r or isinstance(r, Exception):
+                            continue
+                        ev, outcome, tok, res = r
+                        if not res:
+                            continue
+                        y, n = res
+                        price = y if outcome == "YES" else n
+                        if price:
+                            quotes.append(
+                                MarketQuote(
+                                    exchange="polymarket",
+                                    market_id=str(tok),
+                                    event=ev,
+                                    outcome=outcome,
+                                    price=float(price),
+                                    size=0.0,
+                                )
+                            )
+                any_emitted = True
+                yield quotes
+
+        # If still nothing, fallback to CLOB markets endpoint
+        if not any_emitted:
+            async for raw_page in self._yield_pages(self._clob_markets_url, {}, page_limit=page_limit, max_pages=max_pages):
+                timed = self._filter_and_time_window(raw_page)
+                if not timed:
+                    continue
+                quotes, tokens_needed = self._markets_to_quotes(timed)
+                if tokens_needed:
+                    sem = asyncio.Semaphore(int(os.environ.get("POLYMARKET_OB_CONCURRENCY", "8")))
+                    async def worker(ev: str, outcome: str, tok: str):
+                        if not tok:
+                            return None
+                        async with sem:
+                            res = await self._fetch_orderbook_prices(tok)
+                            return (ev, outcome, tok, res)
+                    results = await asyncio.gather(*[worker(e, o, t) for e, o, t in tokens_needed], return_exceptions=True)
+                    for r in results:
+                        if not r or isinstance(r, Exception):
+                            continue
+                        ev, outcome, tok, res = r
+                        if not res:
+                            continue
+                        y, n = res
+                        price = y if outcome == "YES" else n
+                        if price:
+                            quotes.append(
+                                MarketQuote(
+                                    exchange="polymarket",
+                                    market_id=str(tok),
+                                    event=ev,
+                                    outcome=outcome,
+                                    price=float(price),
+                                    size=0.0,
+                                )
+                            )
+                yield quotes
+
+    async def fetch_markets(self) -> List[dict]:
+        """Fetch active markets from Polymarket Gamma API (read-only).
+
+        Falls back to an empty list on error. This does not require authentication.
+        """
+        # Try Gamma API first, then CLOB fallback
+        markets: List[dict] = []
+
+        async for page in self._yield_pages(
+            self._markets_url,
+            {"active": "true", "order": "updatedAt", "ascending": "false"},
+        ):
+            markets.extend(page)
+
+        if not markets:
+            async for page in self._yield_pages(
+                self._markets_url,
+                {"order": "updatedAt", "ascending": "false"},
+            ):
+                markets.extend(page)
+
+        if not markets:
+            async for page in self._yield_pages(self._clob_markets_url, {}):
+                markets.extend(page)
+
+        timed = self._filter_and_time_window(markets)
+        logger.info(
+            "Polymarket markets fetched: raw=%d, timed=%d",
+            len(markets),
+            len(timed),
+        )
+        return timed
+
+    async def fetch_quotes(self) -> List[MarketQuote]:
+        quotes: List[MarketQuote] = []
+        async for batch in self.iter_quotes():
+            quotes.extend(batch)
         return quotes
 
     async def place_limit_order(
