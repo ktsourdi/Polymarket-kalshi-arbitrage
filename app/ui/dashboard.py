@@ -115,6 +115,105 @@ def render_two_buy(arbs: List[TwoBuyArb]):
     st.dataframe(rows, width='stretch', hide_index=True)
 
 
+def build_match_candidate_rows(
+    kalshi_quotes: List[MQ],
+    poly_quotes: List[MQ],
+    threshold: float,
+    explicit_map: dict[str, str] | None = None,
+):
+    """Build a rows list describing fuzzy-matched pairs with price context.
+
+    This is useful to debug whether our event matching works independently of
+    arbitrage profitability.
+    """
+    matcher = EventMatcher(explicit_map=explicit_map or {}, threshold=threshold)
+    # Build lightweight quotes for candidate generation
+    cands = matcher.build_candidates(
+        [MQ("kalshi", "", q.event, "YES", 0.0, 0.0) for q in kalshi_quotes],
+        [MQ("polymarket", "", q.event, "YES", 0.0, 0.0) for q in poly_quotes],
+    )
+
+    # Build price lookup by event/outcome for quick edge preview
+    from collections import defaultdict
+
+    def _by_event(quotes: List[MQ]):
+        d = defaultdict(dict)
+        for q in quotes:
+            d[q.event][q.outcome] = q
+        return d
+
+    k_by = _by_event(kalshi_quotes)
+    p_by = _by_event(poly_quotes)
+
+    rows = []
+    total_bps = settings.fees.taker_bps + settings.risk.slippage_bps
+    for c in sorted(cands, key=lambda x: x.similarity, reverse=True):
+        try:
+            ek, ep = c.event_key.split(" <-> ", 1)
+        except ValueError:
+            ek, ep = c.event_key, ""
+        kq = k_by.get(ek, {})
+        pq = p_by.get(ep, {})
+        edge_a = None
+        edge_b = None
+        if "YES" in kq and "NO" in pq:
+            edge_a = compute_edge_bps(kq["YES"].price, pq["NO"].price) - total_bps
+        if "YES" in pq and "NO" in kq:
+            edge_b = compute_edge_bps(pq["YES"].price, kq["NO"].price) - total_bps
+        rows.append(
+            {
+                "pair": c.event_key,
+                "similarity": round(float(c.similarity), 3),
+                "K YES": round(kq.get("YES").price, 3) if "YES" in kq else None,
+                "K NO": round(kq.get("NO").price, 3) if "NO" in kq else None,
+                "P YES": round(pq.get("YES").price, 3) if "YES" in pq else None,
+                "P NO": round(pq.get("NO").price, 3) if "NO" in pq else None,
+                "edge_bps K_yes+P_no": round(edge_a, 1) if edge_a is not None else None,
+                "edge_bps P_yes+K_no": round(edge_b, 1) if edge_b is not None else None,
+            }
+        )
+    if rows:
+        return rows, False
+
+    # Lenient fallback: ignore numeric/date guard and entity overlap to surface
+    # nearest neighbors by raw similarity so users can see potential pairs.
+    from app.utils.text import similarity as _sim
+
+    best_rows = []
+    for ek in {q.event for q in kalshi_quotes}:
+        best_ep = None
+        best_score = -1.0
+        for ep in {q.event for q in poly_quotes}:
+            s = float(_sim(ek, ep))
+            if s > best_score:
+                best_score = s
+                best_ep = ep
+        if best_ep is None:
+            continue
+        kq = k_by.get(ek, {})
+        pq = p_by.get(best_ep, {})
+        edge_a = edge_b = None
+        if "YES" in kq and "NO" in pq:
+            edge_a = compute_edge_bps(kq["YES"].price, pq["NO"].price) - total_bps
+        if "YES" in pq and "NO" in kq:
+            edge_b = compute_edge_bps(pq["YES"].price, kq["NO"].price) - total_bps
+        best_rows.append(
+            {
+                "pair": f"{ek} <-> {best_ep}",
+                "similarity": round(best_score, 3),
+                "K YES": round(kq.get("YES").price, 3) if "YES" in kq else None,
+                "K NO": round(kq.get("NO").price, 3) if "NO" in kq else None,
+                "P YES": round(pq.get("YES").price, 3) if "YES" in pq else None,
+                "P NO": round(pq.get("NO").price, 3) if "NO" in pq else None,
+                "edge_bps K_yes+P_no": round(edge_a, 1) if edge_a is not None else None,
+                "edge_bps P_yes+K_no": round(edge_b, 1) if edge_b is not None else None,
+            }
+        )
+    # Sort and keep a manageable number for the grid
+    best_rows.sort(key=lambda r: r["similarity"], reverse=True)
+    return best_rows[:20], True
+
+
 def render_best_cross_summary(arbs: List[CrossExchangeArb]):
     if not arbs:
         return
@@ -156,9 +255,16 @@ with st.sidebar:
     search_time_limit = st.number_input("Search time limit (s)", min_value=2, max_value=60, value=12, step=1)
 
     st.markdown("### Env status")
-    kalshi_ok = bool(os.getenv("KALSHI_API_KEY"))
+    kalshi_key_ok = bool(os.getenv("KALSHI_API_KEY"))
+    kalshi_bearer_ok = bool(os.getenv("KALSHI_BEARER") or os.getenv("KALSHI_SESSION_TOKEN"))
     poly_ok = bool(os.getenv("POLYMARKET_PRIVATE_KEY") or os.getenv("POLYMARKET_API_KEY"))
-    st.write(f"Kalshi: {'OK' if kalshi_ok else 'missing'}")
+    if kalshi_bearer_ok:
+        st.write("Kalshi: OK (full)")
+    elif kalshi_key_ok:
+        st.write("Kalshi: Limited (elections-only)")
+        st.caption("Add KALSHI_BEARER or KALSHI_SESSION_TOKEN to fetch all markets.")
+    else:
+        st.write("Kalshi: missing")
     st.write(f"Polymarket: {'OK' if poly_ok else 'not found'}")
 
     st.markdown("### Risk / Fees")
@@ -202,8 +308,8 @@ if kalshi is None or poly is None:
     if data_mode == "Demo data":
         kalshi, poly = load_quotes_sync()
     else:
-        if not kalshi_ok:
-            st.error("Kalshi credentials not found. Set KALSHI_API_KEY and private key settings in .env.")
+        if not (kalshi_key_ok or kalshi_bearer_ok):
+            st.error("Kalshi credentials not found. For full coverage set KALSHI_BEARER (or KALSHI_SESSION_TOKEN). API key alone may be limited.")
             st.stop()
         if not poly_ok:
             st.warning("Polymarket credentials not found. Proceeding with Kalshi-only live data; cross-exchange results will be empty until you add Polymarket creds.")
@@ -262,7 +368,27 @@ if auto_alias and (auto_run_match or run_match):
 
 explicit_map_for_detection: dict[str, str] = {k: v for k, v in auto_map.items()} if auto_map else {}
 
-tab1, tab2 = st.tabs(["Cross-Exchange", "Two-Buy"])
+# Separate tabs: Matches (fuzzy pairs), Arbitrage (cross-exchange), Two-Buy
+tab_matches, tab1, tab2 = st.tabs(["Matches", "Arbitrage (Cross-Exchange)", "Two-Buy"])
+
+with tab_matches:
+    if auto_run_match or run_match:
+        with st.spinner("Building match candidates..."):
+            rows, was_fallback = build_match_candidate_rows(
+                kalshi_quotes=kalshi,
+                poly_quotes=poly,
+                threshold=float(sim_thresh),
+                explicit_map=explicit_map_for_detection,
+            )
+        if rows:
+            st.dataframe(rows, width='stretch', hide_index=True)
+            if was_fallback:
+                st.caption("Showing best approximate pairs (lenient mode). Consider lowering threshold or enabling embeddings for stricter matches.")
+        else:
+            st.info("No candidate pairs found. Try lowering the threshold or enabling ML embeddings.")
+    else:
+        st.info("Matching not run yet. Click 'Run matching now' or enable auto-run.")
+
 with tab1:
     if auto_run_match or run_match:
         with st.spinner("Running cross-exchange detection..."):
@@ -423,13 +549,15 @@ def _sample(events, n=5):
 
 kalshi_events = [q.event for q in kalshi]
 poly_events = [q.event for q in poly]
+uniq_k = len(set(kalshi_events))
+uniq_p = len(set(poly_events))
 col1, col2 = st.columns(2)
 with col1:
     st.caption("Kalshi live quotes")
-    st.write({"count": len(kalshi_events), "sample": _sample(kalshi_events)})
+    st.write({"count": len(kalshi_events), "unique_events": uniq_k, "sample": _sample(kalshi_events)})
 with col2:
     st.caption("Polymarket live quotes")
-    st.write({"count": len(poly_events), "sample": _sample(poly_events)})
+    st.write({"count": len(poly_events), "unique_events": uniq_p, "sample": _sample(poly_events)})
 
 st.markdown("#### Top candidate pairs (fuzzy matching)")
 if auto_run_match or run_match:
@@ -440,10 +568,19 @@ if auto_run_match or run_match:
         except Exception:
             th_display = sim_thresh
         matcher = EventMatcher(explicit_map=explicit_map_for_detection, threshold=th_display)
-        # Build lightweight quotes for candidate generation
+        # Build lightweight quotes for candidate generation (chunked)
+        def _progress(frac: float):
+            try:
+                if progress_bar is not None:
+                    progress_bar.progress(min(98, max(70, int(70 + 25 * frac))))
+            except Exception:
+                pass
         cands = matcher.build_candidates(
             [MQ("kalshi", "", q.event, "YES", 0.0, 0.0) for q in kalshi],
             [MQ("polymarket", "", q.event, "YES", 0.0, 0.0) for q in poly],
+            limit_sources=None,
+            max_targets_per_source=50,
+            progress_cb=_progress,
         )
         # Build price lookup by event/outcome for quick edge preview
         from collections import defaultdict

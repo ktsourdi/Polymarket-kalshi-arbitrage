@@ -53,7 +53,7 @@ class PolymarketClient:
 
         offset = 0
         eff_page_limit = int(page_limit or int(os.environ.get("POLYMARKET_PAGE_LIMIT", "1000")))
-        eff_max_pages = int(max_pages or int(os.environ.get("POLYMARKET_MAX_PAGES", "3")))
+        eff_max_pages = int(max_pages or int(os.environ.get("POLYMARKET_MAX_PAGES", "10")))
         for _ in range(eff_max_pages):
             params = {"limit": eff_page_limit, "offset": offset}
             if base_params:
@@ -65,6 +65,37 @@ class PolymarketClient:
             if len(batch) < eff_page_limit:
                 break
             offset += len(batch)
+
+    async def _fetch_clob_markets_cursor(self, *, max_pages: int | None = None) -> List[dict]:
+        """Fetch markets from CLOB using cursor-based pagination.
+
+        This mirrors py-clob-client's get_markets() method which uses
+        next_cursor and END_CURSOR semantics. Returns a flat list of market dicts.
+        """
+        markets: List[dict] = []
+        next_cursor = os.environ.get("POLYMARKET_START_CURSOR", "MA==")
+        end_cursor = os.environ.get("POLYMARKET_END_CURSOR", "LTE=")
+        pages = 0
+        eff_max_pages = int(max_pages or int(os.environ.get("POLYMARKET_MAX_PAGES", "50")))
+        try:
+            while next_cursor != end_cursor and pages < eff_max_pages:
+                resp = await self._client.get(self._clob_markets_url, params={"next_cursor": next_cursor})
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, dict):
+                    items = data.get("data") or data.get("markets") or []
+                    if isinstance(items, list):
+                        markets.extend(items)
+                    next_cursor = data.get("next_cursor") or end_cursor
+                elif isinstance(data, list):
+                    markets.extend(data)
+                    next_cursor = end_cursor
+                else:
+                    break
+                pages += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Polymarket CLOB cursor fetch failed: %s", exc)
+        return markets
 
     @staticmethod
     def _is_live(m: dict) -> bool:
@@ -100,11 +131,13 @@ class PolymarketClient:
         filtered = [m for m in markets if self._is_live(m)]
         final = filtered if filtered or raw_count == 0 else markets
 
-        # Date filter: keep reasonably current markets (past 30d to next 365d)
+        # Date filter: keep reasonably current markets (configurable via env)
         now = datetime.now(timezone.utc)
         from datetime import timedelta
-        past_cutoff = now - timedelta(days=30)
-        future_cutoff = now + timedelta(days=365)
+        past_days = int(os.environ.get("POLYMARKET_PAST_DAYS", "30"))
+        future_days = int(os.environ.get("POLYMARKET_FUTURE_DAYS", "365"))
+        past_cutoff = now - timedelta(days=past_days)
+        future_cutoff = now + timedelta(days=future_days)
 
         timed: List[dict] = []
         include_no_date = os.environ.get("POLYMARKET_INCLUDE_NO_DATE", "0").lower() in {"1", "true", "yes"}
@@ -415,29 +448,42 @@ class PolymarketClient:
                 yield quotes
 
     async def fetch_markets(self) -> List[dict]:
-        """Fetch active markets from Polymarket Gamma API (read-only).
+        """Fetch markets from Polymarket Gamma plus optional CLOB fallback.
 
-        Falls back to an empty list on error. This does not require authentication.
+        Strategy:
+        1) Pull Gamma active markets (broadest recent set).
+        2) Also pull Gamma without the active filter to capture additional listings.
+        3) Optionally pull CLOB markets if POLYMARKET_FORCE_CLOB=1.
+        All results are merged and de-duplicated by id.
         """
-        # Try Gamma API first, then CLOB fallback
         markets: List[dict] = []
+        seen: set[str] = set()
 
-        async for page in self._yield_pages(
-            self._markets_url,
-            {"active": "true", "order": "updatedAt", "ascending": "false"},
-        ):
-            markets.extend(page)
+        async def _extend(pages_iter):
+            nonlocal markets, seen
+            async for page in pages_iter:
+                for m in page:
+                    mid = str(m.get("id") or m.get("market_id") or m.get("question") or "")
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+                    markets.append(m)
 
-        if not markets:
-            async for page in self._yield_pages(
-                self._markets_url,
-                {"order": "updatedAt", "ascending": "false"},
-            ):
-                markets.extend(page)
-
-        if not markets:
-            async for page in self._yield_pages(self._clob_markets_url, {}):
-                markets.extend(page)
+        # 1) Gamma active
+        await _extend(self._yield_pages(self._markets_url, {"active": "true", "order": "updatedAt", "ascending": "false"}))
+        # 2) Gamma without active filter (merge)
+        await _extend(self._yield_pages(self._markets_url, {"order": "updatedAt", "ascending": "false"}))
+        # 3) Optional CLOB merge
+        force_clob = os.environ.get("POLYMARKET_FORCE_CLOB", "0").lower() in {"1", "true", "yes"}
+        use_clob_cursor = os.environ.get("POLYMARKET_USE_CLOB_CURSOR", "1").lower() in {"1", "true", "yes"}
+        if force_clob or not markets or use_clob_cursor:
+            # Prefer cursor-based pagination which is the official method
+            clob_markets = await self._fetch_clob_markets_cursor()
+            if not clob_markets and not use_clob_cursor:
+                # Fallback to offset/limit if cursor yields nothing
+                await _extend(self._yield_pages(self._clob_markets_url, {}))
+            else:
+                await _extend(iter([clob_markets]))
 
         timed = self._filter_and_time_window(markets)
         logger.info(
