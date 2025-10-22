@@ -207,11 +207,13 @@ class PolymarketClient:
             mapped = False
             if isinstance(outcomes, list) and outcomes and isinstance(prices, list) and len(prices) == len(outcomes):
                 for idx, name in enumerate(outcomes):
-                    outcome_name = str(name).upper()
+                    raw_outcome = str(name).strip()
+                    outcome_name = raw_outcome.upper()
                     price = to_price(prices[idx])
                     token_id = None
                     if tokens and idx < len(tokens):
                         token_id = tokens[idx]
+                    # Binary YES/NO market
                     if outcome_name in {"YES", "NO"} and price:
                         quotes.append(
                             MarketQuote(
@@ -225,6 +227,22 @@ class PolymarketClient:
                         )
                         if not token_id:
                             tokens_needed.append((event, outcome_name, token_id or ""))
+                        mapped = True
+                    # Categorical outcome: publish pseudo-binary "event — outcome" with YES price
+                    elif price:
+                        cat_event = f"{event} — {raw_outcome}"
+                        quotes.append(
+                            MarketQuote(
+                                exchange="polymarket",
+                                market_id=str(token_id or f"{m.get('id')}-{idx}"),
+                                event=cat_event,
+                                outcome="YES",
+                                price=price,
+                                size=size,
+                            )
+                        )
+                        if not token_id:
+                            tokens_needed.append((cat_event, "YES", token_id or ""))
                         mapped = True
 
             if mapped:

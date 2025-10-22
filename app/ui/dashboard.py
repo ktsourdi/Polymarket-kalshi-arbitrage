@@ -138,7 +138,12 @@ with st.sidebar:
     refresh = st.button("Refresh data", type="primary")
     st.caption("Demo uses randomized mocked quotes. Live fetch attempts real APIs.")
     st.markdown("### Matching")
-    sim_thresh = st.slider("Fuzzy match threshold", min_value=0.6, max_value=0.95, value=0.8, step=0.01)
+    auto_threshold = st.checkbox("Auto-select threshold", value=True)
+    if not auto_threshold:
+        sim_thresh = st.slider("Fuzzy match threshold", min_value=0.6, max_value=0.95, value=0.8, step=0.01)
+    else:
+        # Placeholder default; an automatic sweep later selects the actual threshold
+        sim_thresh = 0.8
     keyword = st.text_input("Keyword filter (optional)", value="")
     auto_alias = st.checkbox("Auto-build alias from titles", value=True)
     use_openai = st.checkbox("Use external embeddings (OpenAI)", value=True)
@@ -147,7 +152,6 @@ with st.sidebar:
     auto_run_match = st.checkbox("Auto-run matching on changes", value=False)
     use_llm_validation = st.checkbox("LLM logical validation (OpenAI)", value=True)
     llm_model = st.text_input("LLM model for validation", value="gpt-4o-mini")
-    auto_threshold = st.checkbox("Auto-select threshold", value=True)
 
     st.markdown("### Env status")
     kalshi_ok = bool(os.getenv("KALSHI_API_KEY"))
@@ -236,6 +240,7 @@ if auto_alias and (auto_run_match or run_match):
                     min_similarity=float(sim_thresh),
                     strict_numbers=bool(strict_numbers),
                     model=openai_model,
+                    progress_cb=(lambda f: progress_bar.progress(max(6, int(25 * max(0.0, min(1.0, f))))) if progress_bar else None),
                 )
                 for s_orig, (tgt, score) in ml_map.items():
                     auto_map[_key(s_orig)] = tgt
