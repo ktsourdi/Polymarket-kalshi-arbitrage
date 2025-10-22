@@ -152,6 +152,8 @@ with st.sidebar:
     auto_run_match = st.checkbox("Auto-run matching on changes", value=False)
     use_llm_validation = st.checkbox("LLM logical validation (OpenAI)", value=True)
     llm_model = st.text_input("LLM model for validation", value="gpt-4o-mini")
+    search_until_found = st.checkbox("Keep searching until found", value=True)
+    search_time_limit = st.number_input("Search time limit (s)", min_value=2, max_value=60, value=12, step=1)
 
     st.markdown("### Env status")
     kalshi_ok = bool(os.getenv("KALSHI_API_KEY"))
@@ -164,6 +166,7 @@ with st.sidebar:
     slippage_bps = st.number_input("Slippage buffer (bps)", min_value=0.0, max_value=200.0, value=float(settings.risk.slippage_bps), step=1.0)
     max_notional = st.number_input("Max notional per leg ($)", min_value=10.0, max_value=100000.0, value=float(settings.risk.max_notional_per_leg), step=10.0)
     min_profit = st.number_input("Min profit ($)", min_value=0.0, max_value=1000.0, value=float(settings.risk.min_profit_usd), step=0.5)
+    auto_optimize_fees = st.checkbox("Auto-optimize risk/fees", value=True)
     if st.button("Apply settings"):
         # Apply live settings and clear caches so detection recomputes
         settings.fees.taker_bps = float(taker_bps)
@@ -211,7 +214,12 @@ if kalshi is None or poly is None:
 def _kw_ok(q):
     if not keyword:
         return True
-    return keyword.lower() in q.event.lower()
+    text = q.event.lower()
+    # Match if ANY token (>=3 chars) from the keyword exists in the title
+    tokens = [t for t in keyword.lower().replace(",", " ").split() if len(t) >= 3]
+    if not tokens:
+        return True
+    return any(t in text for t in tokens)
 kalshi = [q for q in kalshi if _kw_ok(q)]
 poly = [q for q in poly if _kw_ok(q)]
 
@@ -287,6 +295,66 @@ with tab1:
                     similarity_threshold=sim_thresh,
                     explicit_map=explicit_map_for_detection,
                 )
+        if (not cross) and search_until_found:
+            import time as _t
+            deadline = _t.time() + float(search_time_limit)
+            trial_thresholds = [0.9, 0.85, 0.8, 0.78, 0.75, 0.72, 0.7, 0.68, 0.66, 0.64, 0.62, 0.6]
+            i = 0
+            while _t.time() < deadline and not cross:
+                t = trial_thresholds[i % len(trial_thresholds)]
+                cand = detect_arbs_with_matcher(
+                    kalshi,
+                    poly,
+                    similarity_threshold=t,
+                    explicit_map=explicit_map_for_detection,
+                )
+                if cand:
+                    chosen_thresh = t
+                    cross = cand
+                    break
+                i += 1
+                if progress_bar is not None:
+                    progress_bar.progress(min(60 + i * 2, 64))
+        # Auto-optimize fees/min profit to surface best edge without user tuning
+        chosen_fees = (settings.fees.taker_bps, settings.risk.slippage_bps, settings.risk.min_profit_usd)
+        if auto_optimize_fees:
+            fee_grid = [1.0, 3.0, 5.0, float(settings.fees.taker_bps)]
+            slip_grid = [1.0, 3.0, 5.0, float(settings.risk.slippage_bps)]
+            profit_grid = [0.0, 0.5, 1.0, float(settings.risk.min_profit_usd)]
+            best_profit = -1.0
+            best_combo = None
+            best_cross = cross
+            # Helper to run detect with temp settings
+            def _run_with(tb, sb, mp):
+                tb0, sb0, mp0 = settings.fees.taker_bps, settings.risk.slippage_bps, settings.risk.min_profit_usd
+                try:
+                    settings.fees.taker_bps = float(tb)
+                    settings.risk.slippage_bps = float(sb)
+                    settings.risk.min_profit_usd = float(mp)
+                    res = detect_arbs(kalshi, poly)
+                    if not res:
+                        res = detect_arbs_with_matcher(
+                            kalshi,
+                            poly,
+                            similarity_threshold=chosen_thresh,
+                            explicit_map=explicit_map_for_detection,
+                        )
+                    return res
+                finally:
+                    settings.fees.taker_bps, settings.risk.slippage_bps, settings.risk.min_profit_usd = tb0, sb0, mp0
+            for tb in fee_grid:
+                for sb in slip_grid:
+                    for mp in profit_grid:
+                        cand = _run_with(tb, sb, mp)
+                        if cand:
+                            m = max(cand, key=lambda a: (a.gross_profit_usd, a.edge_bps))
+                            if m.gross_profit_usd > best_profit:
+                                best_profit = m.gross_profit_usd
+                                best_combo = (tb, sb, mp)
+                                best_cross = cand
+            if best_combo is not None:
+                chosen_fees = best_combo
+                cross = best_cross
         if progress_bar is not None:
             progress_bar.progress(65)
         # Optional LLM validation to filter implausible pairs by title logic
@@ -300,8 +368,14 @@ with tab1:
                 cross = [c for c in cross if verdicts.get((c.long.event, c.short.event), {}).get("same_event") and verdicts.get((c.long.event, c.short.event), {}).get("direction_consistent", True)]
             except Exception as e:  # noqa: BLE001
                 st.warning(f"LLM validation failed: {e}")
+        cap = []
         if auto_threshold and cross:
-            st.caption(f"Auto-selected fuzzy threshold: {chosen_thresh:.2f}")
+            cap.append(f"threshold={chosen_thresh:.2f}")
+        if auto_optimize_fees and cross:
+            tb, sb, mp = chosen_fees
+            cap.append(f"fees={tb:.0f}bps, slip={sb:.0f}bps, min_profit=${mp:.2f}")
+        if cap:
+            st.caption("Auto settings → " + ", ".join(cap))
         render_best_cross_summary(cross)
         render_cross_arbs(cross)
     else:
