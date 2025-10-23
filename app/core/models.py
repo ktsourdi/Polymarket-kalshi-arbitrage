@@ -1,6 +1,13 @@
+"""Core data models for market quotes and arbitrage opportunities.
+
+This module defines the fundamental data structures used throughout the application
+for representing market data, matching candidates, and arbitrage opportunities.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal, Optional
 
 Side = Literal["YES", "NO"]
@@ -14,6 +21,7 @@ class MarketQuote:
     outcome: Side
     price: float  # in USD from 0 to 1
     size: float  # maximum fillable contracts (notional = price * size)
+    end_date: Optional[datetime] = None  # Market resolution date
 
 
 @dataclass(frozen=True)

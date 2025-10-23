@@ -49,6 +49,16 @@ _STOP_ENTS = {
     "october",
     "november",
     "december",
+    # Common capitalized words that shouldn't be treated as unique entities
+    "google",
+    "year",
+    "search",
+    "global",
+    "actors",
+    "people",
+    "rank",
+    "ranked",
+    "globally",
 }
 
 
@@ -56,6 +66,8 @@ def extract_entity_tokens(value: str) -> Set[str]:
     """Extract crude entity-like tokens (capitalized or acronyms).
 
     This is a lightweight heuristic to reduce obvious mismatches without heavy NLP.
+    Focuses on capturing person names and other unique identifiers while filtering
+    out common capitalized words.
     """
     raw_tokens = re.findall(r"[A-Z][a-zA-Z]+|[A-Z]{2,}|[A-Z][a-z]+\.[A-Z][a-z]+", value)
     ents: Set[str] = set()

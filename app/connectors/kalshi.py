@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 import os
+from datetime import datetime, timezone
 
 import httpx
 
@@ -42,7 +43,8 @@ class KalshiClient:
             if self.bearer_token:
                 headers["Authorization"] = f"Bearer {self.bearer_token}"
             cursor = None
-            max_pages = int(os.environ.get("KALSHI_MAX_PAGES", "2"))
+            # Fetch more pages by default to improve coverage. Can override via env.
+            max_pages = int(os.environ.get("KALSHI_MAX_PAGES", "10"))
             page = 0
             for _ in range(max_pages):  # soft cap to avoid huge downloads
                 params = {"limit": int(os.environ.get("KALSHI_PAGE_LIMIT", "1000")), "status": "active"}
@@ -103,11 +105,38 @@ class KalshiClient:
             logger.warning("Failed to fetch Kalshi markets: %s", exc)
         return markets
 
+    @staticmethod
+    def _parse_dt(value: str | None) -> datetime | None:
+        """Parse Kalshi date string."""
+        if not value or not isinstance(value, str):
+            return None
+        try:
+            # Kalshi uses ISO format dates
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt
+        except Exception:
+            return None
+
     async def fetch_quotes(self) -> List[MarketQuote]:
         markets = await self.fetch_markets()
         quotes: List[MarketQuote] = []
         for m in markets:
             event = m.get("title") or m.get("subtitle") or m.get("ticker") or m.get("name") or ""
+            
+            # Extract end date from various possible fields
+            end_date = (
+                self._parse_dt(m.get("settle_time"))
+                or self._parse_dt(m.get("settle_time_iso"))
+                or self._parse_dt(m.get("end_time"))
+                or self._parse_dt(m.get("expiration_time"))
+                or self._parse_dt(m.get("expiration_time_iso"))
+            )
             # Prefer dollar fields (already 0-1). Fallback to integer cents.
             def _to_price_dollars(*keys):
                 for k in keys:
@@ -151,6 +180,7 @@ class KalshiClient:
                     outcome="YES",
                     price=yes_price,
                     size=size,
+                    end_date=end_date,
                 )
             )
             quotes.append(
@@ -161,6 +191,7 @@ class KalshiClient:
                     outcome="NO",
                     price=no_price,
                     size=size,
+                    end_date=end_date,
                 )
             )
         return quotes
