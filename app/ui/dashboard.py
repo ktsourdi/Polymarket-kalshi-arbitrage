@@ -17,14 +17,18 @@ import streamlit as st
 import time
 
 from app.connectors.demo import fetch_kalshi_demo, fetch_polymarket_demo
-from app.core.arb import detect_arbs, detect_two_buy_arbs, detect_arbs_with_matcher, compute_edge_bps
+from app.core.arb import detect_arbs, detect_two_buy_arbs, detect_arbs_with_matcher, compute_edge_bps, compute_arb_percentage, calculate_profit_for_budget
 from app.config.settings import settings
 from app.core.models import CrossExchangeArb, TwoBuyArb, MarketQuote as MQ
 from app.core.matching import EventMatcher
+from app.core.embedding_matcher import build_embedding_candidates_async
 from app.utils.text import similarity, extract_numbers_window
 from app.utils.ml_match import build_tfidf_map
 from app.utils.embeddings import build_embedding_map_openai
 from app.utils.llm_validate import validate_pairs_openai
+from app.utils.timing import TimingTracker, timer
+from app.utils.links import get_event_link, polymarket_market_url, kalshi_market_url
+from app.utils.date_filter import filter_by_days_until_resolution, format_resolution_date
 
 
 st.set_page_config(page_title="Polymarket–Kalshi Arbitrage", layout="wide")
@@ -74,25 +78,43 @@ def load_quotes_live_sync():
     return asyncio.run(_run())
 
 
-def render_cross_arbs(arbs: List[CrossExchangeArb]):
+def render_cross_arbs(arbs: List[CrossExchangeArb], budget: float = 1000.0):
     if not arbs:
         st.info("No cross-exchange opportunities found.")
         return
     rows = []
     for a in arbs:
+        # Calculate profit for given budget
+        arb_pct = compute_arb_percentage(a.edge_bps)
+        notional, stake_long, stake_short, profit = calculate_profit_for_budget(
+            a.edge_bps, a.max_notional, budget
+        )
+        
+        # Generate links
+        long_link = kalshi_market_url(a.long.market_id) if a.long.exchange == "kalshi" else polymarket_market_url(a.long.market_id)
+        short_link = kalshi_market_url(a.short.market_id) if a.short.exchange == "kalshi" else polymarket_market_url(a.short.market_id)
+        
+        # Format strategy string with links
+        strategy = f"Buy {a.long.outcome} on [{a.long.exchange}]({long_link}) @ ${a.long.price:.3f}\n" \
+                   f"Buy {a.short.outcome} on [{a.short.exchange}]({short_link}) @ ${a.short.price:.3f}"
+        
         rows.append(
             {
                 "event": a.event_key,
-                "long_exch": a.long.exchange,
-                "long_price": round(a.long.price, 2),
-                "short_exch": a.short.exchange,
-                "short_price": round(a.short.price, 2),
-                "edge_bps": round(a.edge_bps, 1),
-                "max_notional": round(a.max_notional, 2),
-                "gross_profit_usd": round(a.gross_profit_usd, 2),
+                "arb %": f"{arb_pct:.2f}%",
+                "profit": f"${profit:.2f}",
+                "stake": f"${notional:.2f}",
+                "strategy": strategy,
+                "view long": long_link,
+                "view short": short_link,
             }
         )
-    st.dataframe(rows, width='stretch', hide_index=True)
+    
+    # Display as dataframe with clickable links
+    df = st.dataframe(rows, width='stretch', hide_index=True, column_config={
+        "view long": st.column_config.LinkColumn("Long Market", display_text="🔗 Open"),
+        "view short": st.column_config.LinkColumn("Short Market", display_text="🔗 Open"),
+    })
 
 
 def render_two_buy(arbs: List[TwoBuyArb]):
@@ -273,6 +295,19 @@ with st.sidebar:
     max_notional = st.number_input("Max notional per leg ($)", min_value=10.0, max_value=100000.0, value=float(settings.risk.max_notional_per_leg), step=10.0)
     min_profit = st.number_input("Min profit ($)", min_value=0.0, max_value=1000.0, value=float(settings.risk.min_profit_usd), step=0.5)
     auto_optimize_fees = st.checkbox("Auto-optimize risk/fees", value=True)
+    
+    st.markdown("### Profit Calculator")
+    budget = st.number_input("Budget ($)", min_value=10.0, max_value=100000.0, value=1000.0, step=50.0)
+    
+    st.markdown("### Date Filter")
+    use_date_filter = st.checkbox("Filter by resolution date", value=False)
+    if use_date_filter:
+        min_days = st.number_input("Min days until resolution", min_value=0, max_value=365, value=0, step=1)
+        max_days = st.number_input("Max days until resolution", min_value=0, max_value=365, value=90, step=1)
+    else:
+        min_days = None
+        max_days = None
+    
     if st.button("Apply settings"):
         # Apply live settings and clear caches so detection recomputes
         settings.fees.taker_bps = float(taker_bps)
@@ -304,7 +339,12 @@ if cache_key in st.session_state:
     except Exception:
         kalshi, poly = None, None
 
+# Initialize timing tracker
+if 'timing_tracker' not in st.session_state:
+    st.session_state.timing_tracker = TimingTracker()
+
 if kalshi is None or poly is None:
+    st.session_state.timing_tracker.start("fetch_data")
     if data_mode == "Demo data":
         kalshi, poly = load_quotes_sync()
     else:
@@ -314,6 +354,7 @@ if kalshi is None or poly is None:
         if not poly_ok:
             st.warning("Polymarket credentials not found. Proceeding with Kalshi-only live data; cross-exchange results will be empty until you add Polymarket creds.")
         kalshi, poly = load_quotes_live_sync()
+    st.session_state.timing_tracker.stop("fetch_data")
     st.session_state[cache_key] = (kalshi, poly)
 
 # Optional keyword filtering to increase overlap
@@ -328,6 +369,11 @@ def _kw_ok(q):
     return any(t in text for t in tokens)
 kalshi = [q for q in kalshi if _kw_ok(q)]
 poly = [q for q in poly if _kw_ok(q)]
+
+# Apply date filter if enabled
+if use_date_filter:
+    kalshi = filter_by_days_until_resolution(kalshi, min_days=min_days, max_days=max_days)
+    poly = filter_by_days_until_resolution(poly, min_days=min_days, max_days=max_days)
 
 # Step 2: Matching trigger
 run_match = st.button("Run matching now", type="primary")
@@ -356,7 +402,15 @@ if auto_alias and (auto_run_match or run_match):
                     model=openai_model,
                     progress_cb=(lambda f: progress_bar.progress(max(6, int(25 * max(0.0, min(1.0, f))))) if progress_bar else None),
                 )
+                # Enforce entity/name overlap to avoid mismatching different people
                 for s_orig, (tgt, score) in ml_map.items():
+                    try:
+                        ents_s = set(extract_entity_tokens(s_orig))
+                        ents_t = set(extract_entity_tokens(tgt))
+                    except Exception:
+                        ents_s, ents_t = set(), set()
+                    if ents_s and ents_t and not (ents_s & ents_t):
+                        continue
                     auto_map[_key(s_orig)] = tgt
             except Exception as e:  # noqa: BLE001
                 st.error(f"OpenAI embeddings failed: {e}")
@@ -373,6 +427,7 @@ tab_matches, tab1, tab2 = st.tabs(["Matches", "Arbitrage (Cross-Exchange)", "Two
 
 with tab_matches:
     if auto_run_match or run_match:
+        st.session_state.timing_tracker.start("match_candidates")
         with st.spinner("Building match candidates..."):
             rows, was_fallback = build_match_candidate_rows(
                 kalshi_quotes=kalshi,
@@ -380,6 +435,7 @@ with tab_matches:
                 threshold=float(sim_thresh),
                 explicit_map=explicit_map_for_detection,
             )
+        st.session_state.timing_tracker.stop("match_candidates")
         if rows:
             st.dataframe(rows, width='stretch', hide_index=True)
             if was_fallback:
@@ -391,8 +447,15 @@ with tab_matches:
 
 with tab1:
     if auto_run_match or run_match:
+        st.session_state.timing_tracker.start("detect_arbs")
         with st.spinner("Running cross-exchange detection..."):
-            cross = detect_arbs(kalshi, poly)
+            # Always use fuzzy matching to find cross-exchange opportunities
+            cross = detect_arbs_with_matcher(
+                kalshi,
+                poly,
+                similarity_threshold=sim_thresh,
+                explicit_map=explicit_map_for_detection,
+            )
         chosen_thresh = sim_thresh
         if not cross:
             if auto_threshold:
@@ -481,10 +544,12 @@ with tab1:
             if best_combo is not None:
                 chosen_fees = best_combo
                 cross = best_cross
+        st.session_state.timing_tracker.stop("detect_arbs")
         if progress_bar is not None:
             progress_bar.progress(65)
         # Optional LLM validation to filter implausible pairs by title logic
         if use_llm_validation and cross:
+            st.session_state.timing_tracker.start("llm_validation")
             pairs = []
             for c in cross:
                 # Titles stored in long/short MarketQuote
@@ -494,6 +559,8 @@ with tab1:
                 cross = [c for c in cross if verdicts.get((c.long.event, c.short.event), {}).get("same_event") and verdicts.get((c.long.event, c.short.event), {}).get("direction_consistent", True)]
             except Exception as e:  # noqa: BLE001
                 st.warning(f"LLM validation failed: {e}")
+            finally:
+                st.session_state.timing_tracker.stop("llm_validation")
         cap = []
         if auto_threshold and cross:
             cap.append(f"threshold={chosen_thresh:.2f}")
@@ -503,13 +570,15 @@ with tab1:
         if cap:
             st.caption("Auto settings → " + ", ".join(cap))
         render_best_cross_summary(cross)
-        render_cross_arbs(cross)
+        render_cross_arbs(cross, budget=budget)
     else:
         st.info("Matching not run yet. Click 'Run matching now' or enable auto-run.")
 with tab2:
     if auto_run_match or run_match:
+        st.session_state.timing_tracker.start("detect_two_buy")
         with st.spinner("Running two-buy detection..."):
             two = detect_two_buy_arbs(kalshi, poly)
+        st.session_state.timing_tracker.stop("detect_two_buy")
         if progress_bar is not None:
             progress_bar.progress(85)
         render_two_buy(two)
@@ -534,6 +603,18 @@ elif data_mode == "Live data (read-only)" and mode == "Run live-skeleton":
 
         result = asyncio.run(_run())
         st.success(f"Live-skeleton executed. Opportunities handled: {result}")
+
+# Timing Performance Summary
+st.markdown("---")
+st.markdown("#### Performance Timing")
+timing_summary = st.session_state.timing_tracker.summary()
+if timing_summary:
+    cols = st.columns(len(timing_summary))
+    for idx, (name, duration) in enumerate(timing_summary.items()):
+        with cols[idx]:
+            st.metric(label=name.replace("_", " ").title(), value=duration)
+else:
+    st.info("No timing data yet. Run matching to see performance metrics.")
 
 # Diagnostics
 st.markdown("---")
@@ -567,21 +648,54 @@ if auto_run_match or run_match:
             th_display = chosen_thresh  # from above scope if set
         except Exception:
             th_display = sim_thresh
-        matcher = EventMatcher(explicit_map=explicit_map_for_detection, threshold=th_display)
-        # Build lightweight quotes for candidate generation (chunked)
-        def _progress(frac: float):
-            try:
-                if progress_bar is not None:
-                    progress_bar.progress(min(98, max(70, int(70 + 25 * frac))))
-            except Exception:
-                pass
-        cands = matcher.build_candidates(
-            [MQ("kalshi", "", q.event, "YES", 0.0, 0.0) for q in kalshi],
-            [MQ("polymarket", "", q.event, "YES", 0.0, 0.0) for q in poly],
-            limit_sources=None,
-            max_targets_per_source=50,
-            progress_cb=_progress,
-        )
+        # If external embeddings enabled, use embedding-based matcher for better recall
+        if use_openai:
+            if progress_bar is None:
+                progress_bar = progress_container.progress(5)
+            with st.spinner("Building embedding candidates (OpenAI cache)…"):
+                async def _run():
+                    start_ts = time.time()
+                    eta_text = st.empty()
+                    def _progress(frac: float):
+                        try:
+                            if progress_bar is not None:
+                                progress_bar.progress(min(98, max(70, int(70 + 25 * frac))))
+                            # ETA estimation
+                            elapsed = max(0.0, time.time() - start_ts)
+                            if frac > 1e-3:
+                                rem = elapsed * (1.0 / max(1e-3, frac) - 1.0)
+                                eta_text.caption(f"Embedding matcher: {int(frac*100)}% · ~{int(rem)}s remaining")
+                        except Exception:
+                            pass
+                    result = await build_embedding_candidates_async(
+                        kalshi, poly, min_cosine=max(0.6, float(th_display)), model=openai_model, progress_cb=_progress
+                    )
+                    try:
+                        eta_text.empty()
+                    except Exception:
+                        pass
+                    return result
+                try:
+                    cands = asyncio.run(_run())
+                except Exception as e:  # noqa: BLE001
+                    st.warning(f"Embedding-based matching failed: {e}")
+                    cands = []
+        else:
+            matcher = EventMatcher(explicit_map=explicit_map_for_detection, threshold=th_display)
+            # Build lightweight quotes for candidate generation (chunked)
+            def _progress(frac: float):
+                try:
+                    if progress_bar is not None:
+                        progress_bar.progress(min(98, max(70, int(70 + 25 * frac))))
+                except Exception:
+                    pass
+            cands = matcher.build_candidates(
+                [MQ("kalshi", "", q.event, "YES", 0.0, 0.0) for q in kalshi],
+                [MQ("polymarket", "", q.event, "YES", 0.0, 0.0) for q in poly],
+                limit_sources=None,
+                max_targets_per_source=50,
+                progress_cb=_progress,
+            )
         # Build price lookup by event/outcome for quick edge preview
         from collections import defaultdict
         def _by_event(quotes: List[MQ]):

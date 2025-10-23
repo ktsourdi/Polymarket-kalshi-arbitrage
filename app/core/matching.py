@@ -1,11 +1,36 @@
+"""Event matching algorithms for cross-exchange pairing.
+
+This module provides fuzzy matching of events across exchanges using:
+- Token-based inverted indexing for efficient search
+- Numeric window matching for date/number alignment
+- Entity extraction for preventing mismatches
+- Similarity thresholds for quality control
+
+The matching algorithm avoids O(N×M) comparisons by using an inverted index
+on content tokens and numeric windows, dramatically reducing work on large datasets.
+"""
+
 from __future__ import annotations
 
 from collections import defaultdict
 from typing import Dict, Iterable, List, Tuple, Callable, Optional, Set
-import random
+import re
 
 from app.core.models import MarketQuote, MatchCandidate
 from app.utils.text import similarity, extract_numbers_window, extract_entity_tokens
+
+
+def _tokens(text: str) -> Set[str]:
+    """Extract tokens from text for indexing.
+    
+    Args:
+        text: Input text to tokenize
+        
+    Returns:
+        Set of lowercase alphanumeric tokens of length >= 3
+    """
+    t = text.lower()
+    return set(re.findall(r"[a-z0-9]{3,}", t))
 
 
 class EventMatcher:
@@ -37,12 +62,6 @@ class EventMatcher:
             by_event_p[q.event].append(q)
 
         # Build lightweight inverted index for Polymarket events
-        def _tokens(text: str) -> Set[str]:
-            import re
-            t = text.lower()
-            toks = set(re.findall(r"[a-z0-9]{3,}", t))
-            return toks
-
         token_to_events: Dict[str, Set[str]] = defaultdict(set)
         nums_to_events: Dict[Tuple[int, ...], Set[str]] = defaultdict(set)
         all_p_events = list(by_event_p.keys())

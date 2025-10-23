@@ -174,6 +174,13 @@ class PolymarketClient:
         for m in markets:
             event = m.get("question") or m.get("title") or m.get("name") or ""
             size = float(m.get("liquidityNum") or m.get("liquidity") or 0)
+            
+            # Extract end date
+            end_date = (
+                self._parse_dt(m.get("endDateIso"))
+                or self._parse_dt(m.get("endDate"))
+                or self._parse_dt(m.get("updatedAt"))
+            )
 
             # Extract token ids
             token_field = m.get("clobTokenIds") or m.get("clob_token_ids") or m.get("tokenIds")
@@ -248,6 +255,7 @@ class PolymarketClient:
                                 outcome="YES",
                                 price=price,
                                 size=size,
+                                end_date=end_date,
                             )
                         )
                         if not token_id:
@@ -284,6 +292,7 @@ class PolymarketClient:
                         outcome="YES",
                         price=float(yes_price),
                         size=size,
+                        end_date=end_date,
                     )
                 )
             if no_price:
@@ -296,6 +305,7 @@ class PolymarketClient:
                         outcome="NO",
                         price=float(no_price),
                         size=size,
+                        end_date=end_date,
                     )
                 )
             # Track tokens we still need from orderbook
