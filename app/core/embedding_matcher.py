@@ -5,7 +5,12 @@ from typing import Iterable, List, Dict, Tuple, Callable, Optional, Set
 import numpy as np
 
 from app.core.models import MarketQuote, MatchCandidate
-from app.utils.text import extract_numbers_window, extract_entity_tokens
+from app.utils.text import (
+    extract_numbers_window,
+    extract_entity_tokens,
+    build_key_terms_index,
+    weighted_key_overlap,
+)
 from app.utils.emb_cache import embed_texts_openai_cached
 
 
@@ -65,6 +70,10 @@ async def build_embedding_candidates_async(
     k_events = list({q.event for q in kalshi_quotes})
     p_events = list({q.event for q in polymarket_quotes})
 
+    # Compute key terms for semantic focus (TF‑IDF backed, with fallback)
+    k_terms_map = build_key_terms_index(k_events, top_k=8)
+    p_terms_map = build_key_terms_index(p_events, top_k=8)
+
     # Build token index on Kalshi events
     token_to_k: Dict[str, Set[str]] = {}
     nums_to_k: Dict[Tuple[int, ...], Set[str]] = {}
@@ -107,15 +116,31 @@ async def build_embedding_candidates_async(
         if not cand:
             continue
         v_p = p_vecs[p_index[ep]][None, :]  # shape (1, d)
-        idxs = np.array([k_index[ek] for ek in cand], dtype=np.int32)
+        # Stabilize ordering for parallel arrays
+        cand_list = list(cand)
+        idxs = np.array([k_index[ek] for ek in cand_list], dtype=np.int32)
         mat = k_vecs[idxs]  # shape (m, d)
         sims = (v_p @ mat.T).astype(np.float32).ravel()  # cosine since normalized
         if sims.size == 0:
             continue
+        # Apply key-term weighted adjustment to emphasize salient terms
+        p_terms = p_terms_map.get(ep, {})
+        overlaps = np.array([
+            weighted_key_overlap(k_terms_map.get(ek, {}), p_terms) for ek in cand_list
+        ], dtype=np.float32)
+        combined = sims * (0.85 + 0.15 * overlaps)
         # Select top-k above threshold
         top_k = min(top_k_per_poly, sims.size)
-        part = np.argpartition(-sims, top_k - 1)[:top_k]
-        best_pairs = sorted([(int(idxs[j]), float(sims[j])) for j in part if sims[j] >= min_cosine], key=lambda x: x[1], reverse=True)
+        part = np.argpartition(-combined, top_k - 1)[:top_k]
+        best_pairs = sorted(
+            [
+                (int(idxs[j]), float(combined[j]))
+                for j in part
+                if combined[j] >= min_cosine
+            ],
+            key=lambda x: x[1],
+            reverse=True,
+        )
         for ki, score in best_pairs:
             ek = k_events[ki]
             # Numeric and entity guards re-checked (cheap)
@@ -162,6 +187,10 @@ async def build_event_mapping_by_embeddings(
     # Embeddings (cached)
     k_vecs, p_vecs, k_index, p_index = await _embed_events(k_events, p_events, model=model, progress_cb=progress_cb)
 
+    # Key terms maps for overlap weighting
+    k_terms_map = build_key_terms_index(k_events, top_k=8)
+    p_terms_map = build_key_terms_index(p_events, top_k=8)
+
     mapping: Dict[str, str] = {}
     total = max(1, len(p_events))
     for i, ep in enumerate(p_events):
@@ -180,15 +209,22 @@ async def build_event_mapping_by_embeddings(
             continue
 
         v_p = p_vecs[p_index[ep]][None, :]
-        idxs = np.array([k_index[ek] for ek in cand], dtype=np.int32)
+        cand_list = list(cand)
+        idxs = np.array([k_index[ek] for ek in cand_list], dtype=np.int32)
         mat = k_vecs[idxs]
         sims = (v_p @ mat.T).astype(np.float32).ravel()
         if sims.size == 0:
             continue
-        j = int(np.argmax(sims))
-        score = float(sims[j])
+        # Key term overlap adjustment
+        p_terms = p_terms_map.get(ep, {})
+        overlaps = np.array([
+            weighted_key_overlap(k_terms_map.get(ek, {}), p_terms) for ek in cand_list
+        ], dtype=np.float32)
+        combined = sims * (0.85 + 0.15 * overlaps)
+        j = int(np.argmax(combined))
+        score = float(combined[j])
         if score >= min_cosine:
-            ek = [*cand][j]  # idxs[j] maps back, but cand order differs; use idxs
+            # idxs[j] maps into k_events order
             ek = k_events[int(idxs[j])]
             # Final guards
             nums_k = extract_numbers_window(ek)

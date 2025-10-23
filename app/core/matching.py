@@ -17,7 +17,13 @@ from typing import Dict, Iterable, List, Tuple, Callable, Optional, Set
 import re
 
 from app.core.models import MarketQuote, MatchCandidate
-from app.utils.text import similarity, extract_numbers_window, extract_entity_tokens
+from app.utils.text import (
+    similarity,
+    extract_numbers_window,
+    extract_entity_tokens,
+    build_key_terms_index,
+    weighted_key_overlap,
+)
 
 
 def _tokens(text: str) -> Set[str]:
@@ -76,6 +82,11 @@ class EventMatcher:
         if limit_sources is not None:
             k_events = k_events[: int(limit_sources)]
 
+        # Build key-term maps once for lightweight reweighting of similarity
+        p_events_all = list(by_event_p.keys())
+        k_terms_map = build_key_terms_index(k_events, top_k=8)
+        p_terms_map = build_key_terms_index(p_events_all, top_k=8)
+
         candidates: List[MatchCandidate] = []
         total = max(1, len(k_events))
         for idx, ek in enumerate(k_events):
@@ -114,6 +125,9 @@ class EventMatcher:
             for ep in cand:
                 # Prefer explicit mapping when provided
                 s = 1.0 if target and ep.lower() == target.lower() else similarity(ek, ep)
+                # Boost similarity when key terms strongly overlap
+                kt_boost = weighted_key_overlap(k_terms_map.get(ek, {}), p_terms_map.get(ep, {}))
+                s = s * (0.85 + 0.15 * kt_boost)
                 # Require some entity overlap when possible
                 ents_k = extract_entity_tokens(ek)
                 ents_p = extract_entity_tokens(ep)
