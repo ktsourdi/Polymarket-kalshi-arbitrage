@@ -29,6 +29,8 @@ from app.utils.llm_validate import validate_pairs_openai
 from app.utils.timing import TimingTracker, timer
 from app.utils.links import get_event_link, polymarket_market_url, kalshi_market_url
 from app.utils.date_filter import filter_by_days_until_resolution, format_resolution_date
+from app.utils.liquidity_filter import filter_by_liquidity, get_liquidity_summary
+from app.utils.slippage_protection import cap_order_by_liquidity
 
 
 st.set_page_config(page_title="Polymarket–Kalshi Arbitrage", layout="wide")
@@ -308,12 +310,32 @@ with st.sidebar:
         min_days = None
         max_days = None
     
+    st.markdown("### Liquidity Filter")
+    use_liquidity_filter = st.checkbox("Filter markets without orders", value=True)
+    if use_liquidity_filter:
+        require_both_outcomes = st.checkbox("Require both YES and NO orders", value=True)
+        min_price = st.number_input("Min price", min_value=0.0, max_value=1.0, value=0.0, step=0.01, format="%.2f")
+        min_size = st.number_input("Min size", min_value=0.0, max_value=10000.0, value=0.0, step=10.0)
+    else:
+        require_both_outcomes = True
+        min_price = 0.0
+        min_size = 0.0
+    
+    st.markdown("### Slippage Protection")
+    use_slippage_protection = st.checkbox("Cap orders by liquidity depth", value=True)
+    if use_slippage_protection:
+        max_price_impact = st.number_input("Max price impact (%)", min_value=0.0, max_value=10.0, value=1.0, step=0.1, format="%.1f") / 100.0
+    else:
+        max_price_impact = 0.01  # Default 1%
+    
     if st.button("Apply settings"):
         # Apply live settings and clear caches so detection recomputes
         settings.fees.taker_bps = float(taker_bps)
         settings.risk.slippage_bps = float(slippage_bps)
         settings.risk.max_notional_per_leg = float(max_notional)
         settings.risk.min_profit_usd = float(min_profit)
+        # Store slippage protection settings in session state
+        st.session_state.max_price_impact = max_price_impact if use_slippage_protection else 0.01
         load_quotes_sync.clear()
         if 'load_quotes_live_sync' in globals():
             load_quotes_live_sync.clear()
@@ -374,6 +396,11 @@ poly = [q for q in poly if _kw_ok(q)]
 if use_date_filter:
     kalshi = filter_by_days_until_resolution(kalshi, min_days=min_days, max_days=max_days)
     poly = filter_by_days_until_resolution(poly, min_days=min_days, max_days=max_days)
+
+# Apply liquidity filter if enabled
+if use_liquidity_filter:
+    kalshi = filter_by_liquidity(kalshi, require_both_outcomes=require_both_outcomes, min_price=min_price, min_size=min_size)
+    poly = filter_by_liquidity(poly, require_both_outcomes=require_both_outcomes, min_price=min_price, min_size=min_size)
 
 # Step 2: Matching trigger
 run_match = st.button("Run matching now", type="primary")
@@ -466,7 +493,7 @@ with tab1:
                         kalshi,
                         poly,
                         similarity_threshold=t,
-                        explicit_map={},
+                        explicit_map=explicit_map_for_detection,
                     )
                     if cand:
                         # pick best by max gross profit
