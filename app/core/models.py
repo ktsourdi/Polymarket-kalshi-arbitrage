@@ -1,3 +1,9 @@
+"""Core data models for market quotes and arbitrage opportunities.
+
+This module defines the fundamental data structures used throughout the application
+for representing market data, matching candidates, and arbitrage opportunities.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

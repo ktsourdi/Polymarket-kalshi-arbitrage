@@ -11,5 +11,9 @@ __pycache__
 *.crt
 kalshi_api_private.pem
 
+# OpenAI cache and embeddings
+.cache/
+**/.cache/
+
 # OS/editor
 .DS_Store

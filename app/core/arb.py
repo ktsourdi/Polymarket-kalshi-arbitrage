@@ -1,3 +1,12 @@
+"""Arbitrage detection algorithms.
+
+This module contains the core logic for detecting arbitrage opportunities
+across exchanges. It includes:
+- Cross-exchange arbitrage detection (buy YES on one exchange, buy NO on the other)
+- Two-buy arbitrage detection (sum of prices < 1.0)
+- Edge calculation accounting for fees and slippage
+"""
+
 from __future__ import annotations
 
 from typing import Iterable, List

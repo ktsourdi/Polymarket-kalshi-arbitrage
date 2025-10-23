@@ -21,6 +21,7 @@ from app.core.arb import detect_arbs, detect_two_buy_arbs, detect_arbs_with_matc
 from app.config.settings import settings
 from app.core.models import CrossExchangeArb, TwoBuyArb, MarketQuote as MQ
 from app.core.matching import EventMatcher
+from app.core.embedding_matcher import build_embedding_candidates_async
 from app.utils.text import similarity, extract_numbers_window
 from app.utils.ml_match import build_tfidf_map
 from app.utils.embeddings import build_embedding_map_openai
@@ -356,7 +357,15 @@ if auto_alias and (auto_run_match or run_match):
                     model=openai_model,
                     progress_cb=(lambda f: progress_bar.progress(max(6, int(25 * max(0.0, min(1.0, f))))) if progress_bar else None),
                 )
+                # Enforce entity/name overlap to avoid mismatching different people
                 for s_orig, (tgt, score) in ml_map.items():
+                    try:
+                        ents_s = set(extract_entity_tokens(s_orig))
+                        ents_t = set(extract_entity_tokens(tgt))
+                    except Exception:
+                        ents_s, ents_t = set(), set()
+                    if ents_s and ents_t and not (ents_s & ents_t):
+                        continue
                     auto_map[_key(s_orig)] = tgt
             except Exception as e:  # noqa: BLE001
                 st.error(f"OpenAI embeddings failed: {e}")
@@ -567,21 +576,54 @@ if auto_run_match or run_match:
             th_display = chosen_thresh  # from above scope if set
         except Exception:
             th_display = sim_thresh
-        matcher = EventMatcher(explicit_map=explicit_map_for_detection, threshold=th_display)
-        # Build lightweight quotes for candidate generation (chunked)
-        def _progress(frac: float):
-            try:
-                if progress_bar is not None:
-                    progress_bar.progress(min(98, max(70, int(70 + 25 * frac))))
-            except Exception:
-                pass
-        cands = matcher.build_candidates(
-            [MQ("kalshi", "", q.event, "YES", 0.0, 0.0) for q in kalshi],
-            [MQ("polymarket", "", q.event, "YES", 0.0, 0.0) for q in poly],
-            limit_sources=None,
-            max_targets_per_source=50,
-            progress_cb=_progress,
-        )
+        # If external embeddings enabled, use embedding-based matcher for better recall
+        if use_openai:
+            if progress_bar is None:
+                progress_bar = progress_container.progress(5)
+            with st.spinner("Building embedding candidates (OpenAI cache)…"):
+                async def _run():
+                    start_ts = time.time()
+                    eta_text = st.empty()
+                    def _progress(frac: float):
+                        try:
+                            if progress_bar is not None:
+                                progress_bar.progress(min(98, max(70, int(70 + 25 * frac))))
+                            # ETA estimation
+                            elapsed = max(0.0, time.time() - start_ts)
+                            if frac > 1e-3:
+                                rem = elapsed * (1.0 / max(1e-3, frac) - 1.0)
+                                eta_text.caption(f"Embedding matcher: {int(frac*100)}% · ~{int(rem)}s remaining")
+                        except Exception:
+                            pass
+                    result = await build_embedding_candidates_async(
+                        kalshi, poly, min_cosine=max(0.6, float(th_display)), model=openai_model, progress_cb=_progress
+                    )
+                    try:
+                        eta_text.empty()
+                    except Exception:
+                        pass
+                    return result
+                try:
+                    cands = asyncio.run(_run())
+                except Exception as e:  # noqa: BLE001
+                    st.warning(f"Embedding-based matching failed: {e}")
+                    cands = []
+        else:
+            matcher = EventMatcher(explicit_map=explicit_map_for_detection, threshold=th_display)
+            # Build lightweight quotes for candidate generation (chunked)
+            def _progress(frac: float):
+                try:
+                    if progress_bar is not None:
+                        progress_bar.progress(min(98, max(70, int(70 + 25 * frac))))
+                except Exception:
+                    pass
+            cands = matcher.build_candidates(
+                [MQ("kalshi", "", q.event, "YES", 0.0, 0.0) for q in kalshi],
+                [MQ("polymarket", "", q.event, "YES", 0.0, 0.0) for q in poly],
+                limit_sources=None,
+                max_targets_per_source=50,
+                progress_cb=_progress,
+            )
         # Build price lookup by event/outcome for quick edge preview
         from collections import defaultdict
         def _by_event(quotes: List[MQ]):
