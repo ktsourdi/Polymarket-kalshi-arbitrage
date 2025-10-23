@@ -21,6 +21,54 @@ def compute_edge_bps(long_price: float, short_price: float) -> float:
     return edge * 10000.0
 
 
+def compute_arb_percentage(edge_bps: float) -> float:
+    """Convert edge in basis points to percentage.
+    
+    Args:
+        edge_bps: Edge in basis points
+        
+    Returns:
+        Edge as percentage (e.g., 99.1 for 9910 bps)
+    """
+    return edge_bps / 100.0
+
+
+def calculate_profit_for_budget(edge_bps: float, max_notional: float, budget: float) -> tuple[float, float, float]:
+    """Calculate profit and stake sizing for a given budget.
+    
+    Args:
+        edge_bps: Edge in basis points
+        max_notional: Maximum notional per leg
+        budget: Total budget available
+        
+    Returns:
+        Tuple of (actual_notional, stake_long, stake_short, profit)
+        where:
+        - actual_notional: Notional used (min of budget and max_notional)
+        - stake_long: Amount to stake on long leg
+        - stake_short: Amount to stake on short leg
+        - profit: Expected profit
+    """
+    # Cap by budget and max_notional
+    actual_notional = min(budget, max_notional)
+    
+    # For cross-exchange arb, we're hedging:
+    # - Long leg: buy YES at price P
+    # - Short leg: buy NO at price (1-P)
+    # Total cost = actual_notional
+    # Return at maturity = 1.0 (since one side always wins)
+    # Gross profit = actual_notional * edge_percentage
+    
+    edge_pct = edge_bps / 10000.0
+    profit = actual_notional * edge_pct
+    
+    # Stake sizing (equal notional on both legs for hedging)
+    stake_long = actual_notional / 2.0
+    stake_short = actual_notional / 2.0
+    
+    return actual_notional, stake_long, stake_short, profit
+
+
 def detect_arbs(
     kalshi_quotes: Iterable[MarketQuote], polymarket_quotes: Iterable[MarketQuote]
 ) -> List[CrossExchangeArb]:
