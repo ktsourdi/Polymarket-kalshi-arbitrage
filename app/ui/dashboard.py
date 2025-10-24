@@ -27,7 +27,7 @@ from app.utils.ml_match import build_tfidf_map
 from app.utils.embeddings import build_embedding_map_openai
 from app.utils.llm_validate import validate_pairs_openai
 from app.utils.timing import TimingTracker, timer
-from app.utils.links import get_event_link, polymarket_market_url, kalshi_market_url
+from app.utils.links import get_event_link, polymarket_market_url, kalshi_market_url, parse_market_url
 from app.utils.date_filter import filter_by_days_until_resolution, format_resolution_date
 from app.utils.liquidity_filter import filter_by_liquidity, get_liquidity_summary
 from app.utils.slippage_protection import cap_order_by_liquidity
@@ -611,6 +611,160 @@ with tab2:
         render_two_buy(two)
     else:
         st.info("Matching not run yet. Click 'Run matching now' or enable auto-run.")
+
+# Manual Pair Analyzer & Instant Execution
+st.markdown("---")
+st.markdown("#### Manual Pair Arbitrage (User-Linked)")
+with st.form("manual_pair_form"):
+    c1, c2 = st.columns(2)
+    with c1:
+        url_a = st.text_input("Link A (Kalshi or Polymarket)", placeholder="https://kalshi.com/markets/… or https://polymarket.com/event/…")
+    with c2:
+        url_b = st.text_input("Link B (other exchange)", placeholder="https://polymarket.com/… or https://kalshi.com/…")
+    budget_input = st.number_input("Budget ($)", min_value=10.0, max_value=100000.0, value=1000.0, step=50.0, key="manual_budget")
+    analyze = st.form_submit_button("Analyze pair")
+
+manual_pair_result = None
+if analyze:
+    try:
+        # Parse URLs
+        pa = parse_market_url(url_a) if url_a else None
+        pb = parse_market_url(url_b) if url_b else None
+        if not pa or not pb:
+            st.error("Could not parse one or both links. Please check the URLs.")
+        else:
+            exch_a, id_a = pa
+            exch_b, id_b = pb
+            if exch_a == exch_b:
+                st.warning("Both links point to the same exchange. Provide one from each exchange.")
+            else:
+                # Build lookup maps by exchange+id
+                by_id = {}
+                for q in kalshi:
+                    if q.exchange == "kalshi":
+                        by_id[("kalshi", str(q.market_id))] = q
+                for q in poly:
+                    if q.exchange == "polymarket":
+                        by_id[("polymarket", str(q.market_id))] = q
+
+                qa_yes = by_id.get((exch_a, id_a))
+                qa_no = None
+                qb_yes = by_id.get((exch_b, id_b))
+                qb_no = None
+                # If the exact id maps to a single outcome quote (YES or NO), try to find its sibling by event
+                def sibling_by_event(q):
+                    if not q:
+                        return None
+                    # Search within the same dataset
+                    src = kalshi if q.exchange == "kalshi" else poly
+                    desired = "NO" if q.outcome == "YES" else "YES"
+                    for x in src:
+                        if x.event == q.event and x.outcome == desired:
+                            return x
+                    return None
+
+                qa_no = sibling_by_event(qa_yes)
+                qb_no = sibling_by_event(qb_yes)
+
+                # We need a YES from one side and a NO from the other to hedge
+                # Consider both orientations and pick the better edge
+                cand = []
+                if qa_yes and qb_no:
+                    cand.append((qa_yes, qb_no))
+                if qb_yes and qa_no:
+                    cand.append((qb_yes, qa_no))
+
+                from app.core.arb import compute_edge_bps, calculate_profit_for_budget
+                if not cand:
+                    st.info("Could not find both outcomes for the provided markets.")
+                else:
+                    best = None
+                    total_bps = settings.fees.taker_bps + settings.risk.slippage_bps
+                    for yes_q, no_q in cand:
+                        edge_bps = compute_edge_bps(yes_q.price, no_q.price) - total_bps
+                        if edge_bps <= 0:
+                            continue
+                        max_notional = min(
+                            yes_q.size * yes_q.price,
+                            (1 - no_q.price) * no_q.size,
+                            settings.risk.max_notional_per_leg,
+                        )
+                        notional, stake_long, stake_short, profit = calculate_profit_for_budget(edge_bps, max_notional, float(budget_input))
+                        item = {
+                            "yes": yes_q,
+                            "no": no_q,
+                            "edge_bps": edge_bps,
+                            "max_notional": max_notional,
+                            "budget": float(budget_input),
+                            "notional": notional,
+                            "stake_yes": stake_long,
+                            "stake_no": stake_short,
+                            "profit": profit,
+                        }
+                        if (best is None) or (item["profit"] > best["profit"]):
+                            best = item
+                    if best is None:
+                        st.info("No positive edge after fees/slippage for this pair.")
+                    else:
+                        manual_pair_result = best
+    except Exception as e:
+        st.error(f"Manual analysis failed: {e}")
+
+if manual_pair_result:
+    yes_q = manual_pair_result["yes"]
+    no_q = manual_pair_result["no"]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Edge (net)", f"{manual_pair_result['edge_bps']/100:.2f}%")
+    c2.metric("Max Notional", f"${manual_pair_result['max_notional']:.0f}")
+    c3.metric("Stake (used)", f"${manual_pair_result['notional']:.0f}")
+    c4.metric("Profit (est)", f"${manual_pair_result['profit']:.2f}")
+
+    st.write(
+        f"Buy YES on {yes_q.exchange} @ ${yes_q.price:.3f} (market {yes_q.market_id}) and "
+        f"Buy NO on {no_q.exchange} @ ${no_q.price:.3f} (market {no_q.market_id})."
+    )
+
+    # Instant execution button (sends both orders)
+    if st.button("Execute now (both legs)"):
+        async def _run_exec():
+            from app.core.executor import LiveExecutor
+            from app.connectors.kalshi import KalshiClient
+            from app.connectors.polymarket import PolymarketClient
+
+            kalshi_client = KalshiClient(
+                base_url=os.getenv("KALSHI_BASE_URL"),
+                api_key=os.getenv("KALSHI_API_KEY"),
+                api_secret=os.getenv("KALSHI_API_SECRET"),
+            )
+            poly_client = PolymarketClient(
+                base_url=os.getenv("POLYMARKET_BASE_URL"),
+                api_key=os.getenv("POLYMARKET_API_KEY"),
+            )
+            try:
+                # Convert into a TwoBuyArb-like single opportunity with contracts ≈ notional per leg / price
+                from app.core.models import TwoBuyArb
+                contracts = manual_pair_result["notional"] / max(yes_q.price, 1e-9)
+                opp = TwoBuyArb(
+                    event_key=f"{yes_q.event} <-> {no_q.event}",
+                    buy_yes=yes_q,
+                    buy_no=no_q,
+                    sum_price=yes_q.price + no_q.price,
+                    edge_bps=float(manual_pair_result["edge_bps"]),
+                    contracts=float(contracts),
+                    gross_profit_usd=float(manual_pair_result["profit"]),
+                )
+                executor = LiveExecutor(kalshi_client, poly_client)
+                res = await executor.execute_two_buy([opp])
+                return res
+            finally:
+                await kalshi_client.close()
+                await poly_client.close()
+
+        try:
+            fills = asyncio.run(_run_exec())
+            st.success(f"Orders submitted: {len(fills)} legs")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Execution failed: {e}")
 
 # Actions
 st.markdown("---")
