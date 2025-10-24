@@ -82,3 +82,4 @@ def get_event_link(event: str, exchange: str, market_id: str) -> str:
     
     return create_market_link(display_text, url)
 
+

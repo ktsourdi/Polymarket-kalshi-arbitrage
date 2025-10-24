@@ -149,3 +149,4 @@ def clip_price(price: float, min_val: float = 0.01, max_val: float = 0.99) -> fl
     """
     return max(min_val, min(max_val, float(price)))
 
+

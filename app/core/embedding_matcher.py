@@ -5,7 +5,7 @@ from typing import Iterable, List, Dict, Tuple, Callable, Optional, Set
 import numpy as np
 
 from app.core.models import MarketQuote, MatchCandidate
-from app.utils.text import extract_numbers_window, extract_entity_tokens
+from app.utils.text import extract_numbers_window, extract_entity_tokens, extract_yis_actor_subject
 from app.utils.emb_cache import embed_texts_openai_cached
 
 
@@ -122,6 +122,12 @@ async def build_embedding_candidates_async(
             nums_k = extract_numbers_window(ek)
             if nums_k and nums_p and nums_k != nums_p:
                 continue
+            # Special-case Google Year in Search Actors: require identical subject
+            subj_k = extract_yis_actor_subject(ek)
+            subj_p2 = extract_yis_actor_subject(ep)
+            if subj_k is not None or subj_p2 is not None:
+                if not subj_k or not subj_p2 or subj_k != subj_p2:
+                    continue
             ents_k = extract_entity_tokens(ek)
             ents_p = extract_entity_tokens(ep)
             # Require at least one shared entity token when both sides provide them

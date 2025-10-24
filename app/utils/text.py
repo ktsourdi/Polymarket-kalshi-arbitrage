@@ -1,7 +1,7 @@
 import re
 import unicodedata
 from difflib import SequenceMatcher
-from typing import Tuple, Set
+from typing import Tuple, Set, Optional
 
 
 def normalize_text(value: str) -> str:
@@ -36,7 +36,6 @@ _STOP_ENTS = {
     "for",
     "by",
     "at",
-    # Months
     "january",
     "february",
     "march",
@@ -49,26 +48,10 @@ _STOP_ENTS = {
     "october",
     "november",
     "december",
-    # Common capitalized words that shouldn't be treated as unique entities
-    "google",
-    "year",
-    "search",
-    "global",
-    "actors",
-    "people",
-    "rank",
-    "ranked",
-    "globally",
 }
 
 
 def extract_entity_tokens(value: str) -> Set[str]:
-    """Extract crude entity-like tokens (capitalized or acronyms).
-
-    This is a lightweight heuristic to reduce obvious mismatches without heavy NLP.
-    Focuses on capturing person names and other unique identifiers while filtering
-    out common capitalized words.
-    """
     raw_tokens = re.findall(r"[A-Z][a-zA-Z]+|[A-Z]{2,}|[A-Z][a-z]+\.[A-Z][a-z]+", value)
     ents: Set[str] = set()
     for t in raw_tokens:
@@ -77,3 +60,22 @@ def extract_entity_tokens(value: str) -> Set[str]:
             continue
         ents.add(k)
     return ents
+
+
+def extract_yis_actor_subject(value: str) -> Optional[str]:
+    """Extract normalized subject name for Google 'Year in Search' Actors titles.
+
+    Returns lowercase normalized token string or None when pattern not detected.
+    """
+    if not value:
+        return None
+    low = value.lower()
+    if ("year in search" not in low) or ("actor" not in low and "actors" not in low):
+        return None
+    m = re.search(r"will\s+(.+?)\s+be\b", value, flags=re.IGNORECASE)
+    if not m:
+        return None
+    subj = m.group(1).strip()
+    if not subj:
+        return None
+    return normalize_text(subj)

@@ -61,3 +61,4 @@ If date filtering still doesn't work:
 2. Add logging to see what fields are present
 3. Adjust field names based on actual API structure
 
+

@@ -91,3 +91,4 @@ To see the new profit calculator:
 4. Check the "Arbitrage (Cross-Exchange)" tab
 5. See profit calculations for each opportunity
 
+
