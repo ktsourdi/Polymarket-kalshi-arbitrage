@@ -1,7 +1,7 @@
 import re
 import unicodedata
 from difflib import SequenceMatcher
-from typing import Tuple, Set
+from typing import Tuple
 
 
 def normalize_text(value: str) -> str:
@@ -22,58 +22,3 @@ def similarity(a: str, b: str) -> float:
 
 def extract_numbers_window(value: str) -> Tuple[int, ...]:
     return tuple(int(x) for x in re.findall(r"\d{1,4}", value))
-
-
-_STOP_ENTS = {
-    "will",
-    "the",
-    "of",
-    "in",
-    "on",
-    "to",
-    "and",
-    "or",
-    "for",
-    "by",
-    "at",
-    # Months
-    "january",
-    "february",
-    "march",
-    "april",
-    "may",
-    "june",
-    "july",
-    "august",
-    "september",
-    "october",
-    "november",
-    "december",
-    # Common capitalized words that shouldn't be treated as unique entities
-    "google",
-    "year",
-    "search",
-    "global",
-    "actors",
-    "people",
-    "rank",
-    "ranked",
-    "globally",
-}
-
-
-def extract_entity_tokens(value: str) -> Set[str]:
-    """Extract crude entity-like tokens (capitalized or acronyms).
-
-    This is a lightweight heuristic to reduce obvious mismatches without heavy NLP.
-    Focuses on capturing person names and other unique identifiers while filtering
-    out common capitalized words.
-    """
-    raw_tokens = re.findall(r"[A-Z][a-zA-Z]+|[A-Z]{2,}|[A-Z][a-z]+\.[A-Z][a-z]+", value)
-    ents: Set[str] = set()
-    for t in raw_tokens:
-        k = t.lower()
-        if k in _STOP_ENTS:
-            continue
-        ents.add(k)
-    return ents

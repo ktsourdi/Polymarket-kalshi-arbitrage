@@ -138,3 +138,4 @@ def format_resolution_date(quote: MarketQuote) -> str:
         years = days // 365
         return f"In {years} year{'s' if years > 1 else ''}"
 
+
