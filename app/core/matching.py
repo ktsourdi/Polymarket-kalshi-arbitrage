@@ -17,7 +17,7 @@ from typing import Dict, Iterable, List, Tuple, Callable, Optional, Set
 import re
 
 from app.core.models import MarketQuote, MatchCandidate
-from app.utils.text import similarity, extract_numbers_window, extract_entity_tokens
+from app.utils.text import similarity, extract_numbers_window, extract_entity_tokens, extract_yis_actor_subject
 
 
 def _tokens(text: str) -> Set[str]:
@@ -114,6 +114,12 @@ class EventMatcher:
             for ep in cand:
                 # Prefer explicit mapping when provided
                 s = 1.0 if target and ep.lower() == target.lower() else similarity(ek, ep)
+                # Special-case: require exact subject match for Google "Year in Search" Actors
+                subj_k = extract_yis_actor_subject(ek)
+                subj_p = extract_yis_actor_subject(ep)
+                if subj_k is not None or subj_p is not None:
+                    if not subj_k or not subj_p or subj_k != subj_p:
+                        continue
                 # Require some entity overlap when possible
                 ents_k = extract_entity_tokens(ek)
                 ents_p = extract_entity_tokens(ep)
