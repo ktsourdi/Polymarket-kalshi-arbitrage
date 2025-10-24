@@ -138,3 +138,4 @@ def format_duration(seconds: float) -> str:
         secs = seconds % 60
         return f"{minutes}m {secs:.1f}s"
 
+

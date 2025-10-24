@@ -14,14 +14,22 @@ Side = Literal["YES", "NO"]
 
 
 @dataclass(frozen=True)
+class OrderLevel:
+    """Represents a single level in the order book."""
+    price: float
+    size: float
+
+
+@dataclass(frozen=True)
 class MarketQuote:
     exchange: str
     market_id: str
     event: str
     outcome: Side
-    price: float  # in USD from 0 to 1
-    size: float  # maximum fillable contracts (notional = price * size)
+    price: float  # in USD from 0 to 1 (best ask/bid)
+    size: float  # size at best price
     end_date: Optional[datetime] = None  # Market resolution date
+    order_depth: Optional[List[OrderLevel]] = None  # Order book depth levels
 
 
 @dataclass(frozen=True)

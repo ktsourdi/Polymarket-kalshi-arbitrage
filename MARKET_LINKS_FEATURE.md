@@ -80,3 +80,4 @@ To see the links:
 - Kalshi uses tickers or market IDs
 - Streamlit LinkColumn displays links as clickable buttons
 
+

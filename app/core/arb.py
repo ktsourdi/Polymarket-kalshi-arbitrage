@@ -13,6 +13,7 @@ from typing import Iterable, List
 
 from app.config.settings import settings
 from app.core.models import CrossExchangeArb, MarketQuote, TwoBuyArb
+from app.utils.slippage_protection import cap_order_by_liquidity, estimate_execution_cost
 
 
 def compute_edge_bps(long_price: float, short_price: float) -> float:
@@ -92,10 +93,22 @@ def detect_arbs(
         if "YES" in k and "NO" in p:
             # Account for fees and slippage buffers on both legs
             total_bps = settings.fees.taker_bps + settings.risk.slippage_bps
-            edge_bps = compute_edge_bps(k["YES"].price, p["NO"].price) - total_bps
-            if edge_bps > 0:
-                max_notional = min(k["YES"].size * k["YES"].price, p["NO"].size * (1 - p["NO"].price), settings.risk.max_notional_per_leg)
-                gross_profit = edge_bps / 10000.0 * max_notional
+            
+            # Use order book depth to cap size and estimate slippage
+            long_size, short_size, actual_notional = cap_order_by_liquidity(
+                k["YES"], p["NO"], settings.risk.max_notional_per_leg
+            )
+            
+            # Estimate actual fill prices with slippage
+            long_avg_price, long_slippage = estimate_execution_cost(k["YES"], long_size)
+            short_avg_price, short_slippage = estimate_execution_cost(p["NO"], short_size)
+            
+            # Recalculate edge with actual execution prices
+            edge_bps_gross = compute_edge_bps(long_avg_price, short_avg_price)
+            edge_bps = edge_bps_gross - total_bps - long_slippage - short_slippage
+            
+            if edge_bps > 0 and actual_notional > 0:
+                gross_profit = edge_bps / 10000.0 * actual_notional
                 if gross_profit >= settings.risk.min_profit_usd:
                     arbs.append(
                         CrossExchangeArb(
@@ -104,14 +117,25 @@ def detect_arbs(
                             short=p["NO"],
                             edge_bps=edge_bps,
                             gross_profit_usd=gross_profit,
-                            max_notional=max_notional,
+                            max_notional=actual_notional,
                         )
                     )
         if "YES" in p and "NO" in k:
-            edge_bps = compute_edge_bps(p["YES"].price, k["NO"].price) - total_bps
-            if edge_bps > 0:
-                max_notional = min(p["YES"].size * p["YES"].price, k["NO"].size * (1 - k["NO"].price), settings.risk.max_notional_per_leg)
-                gross_profit = edge_bps / 10000.0 * max_notional
+            # Use order book depth to cap size and estimate slippage
+            long_size, short_size, actual_notional = cap_order_by_liquidity(
+                p["YES"], k["NO"], settings.risk.max_notional_per_leg
+            )
+            
+            # Estimate actual fill prices with slippage
+            long_avg_price, long_slippage = estimate_execution_cost(p["YES"], long_size)
+            short_avg_price, short_slippage = estimate_execution_cost(k["NO"], short_size)
+            
+            # Recalculate edge with actual execution prices
+            edge_bps_gross = compute_edge_bps(long_avg_price, short_avg_price)
+            edge_bps = edge_bps_gross - total_bps - long_slippage - short_slippage
+            
+            if edge_bps > 0 and actual_notional > 0:
+                gross_profit = edge_bps / 10000.0 * actual_notional
                 if gross_profit >= settings.risk.min_profit_usd:
                     arbs.append(
                         CrossExchangeArb(
@@ -120,7 +144,7 @@ def detect_arbs(
                             short=k["NO"],
                             edge_bps=edge_bps,
                             gross_profit_usd=gross_profit,
-                            max_notional=max_notional,
+                            max_notional=actual_notional,
                         )
                     )
 
